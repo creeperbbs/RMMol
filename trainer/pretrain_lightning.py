@@ -98,29 +98,22 @@ from sklearn.preprocessing import StandardScaler
 import torch
 
 
-# ---------- QM9 数据加载函数 ----------
 def load_qm9_data(csv_path, smiles_col='smiles', target_cols=None):
-    """读取 QM9 CSV 文件，返回 smiles 列表和目标值 numpy 数组"""
     df = pd.read_csv(csv_path)
     smiles = df[smiles_col].tolist()
     if target_cols is None:
-        # 默认的 12 个回归目标
         target_cols = ['mu', 'alpha', 'homo', 'lumo', 'gap', 'r2', 'zpve', 'u0', 'u298', 'h298', 'g298', 'cv']
     targets = df[target_cols].values.astype(np.float32)
     return smiles, targets
 
+train_csv = r'\smiles\qm9\qm9_small_train.csv'
+valid_csv = r':\smiles\qm9\qm9_small_valid.csv'
+test_csv = r'E:\smiles\qm9\qm9_small_test.csv'
 
-# 指定三个文件路径
-train_csv = r'E:\生信\scMCP\GraphWorld\MOMDGDP-main\dataset\smiles\qm9\qm9_small_train.csv'
-valid_csv = r'E:\生信\scMCP\GraphWorld\MOMDGDP-main\dataset\smiles\qm9\qm9_small_valid.csv'
-test_csv = r'E:\生信\scMCP\GraphWorld\MOMDGDP-main\dataset\smiles\qm9\qm9_small_test.csv'
-
-# 加载数据
 smiles_train, y_train_raw = load_qm9_data(train_csv)
 smiles_valid, y_valid_raw = load_qm9_data(valid_csv)
 smiles_test, y_test_raw = load_qm9_data(test_csv)
 
-# ---------- 目标值标准化（基于训练集） ----------
 scaler = StandardScaler()
 y_train = scaler.fit_transform(y_train_raw)
 y_valid = scaler.transform(y_valid_raw)
@@ -129,7 +122,6 @@ y_test = scaler.transform(y_test_raw)
 
 def evaluate_linear_probe(encoder, smiles_train, y_train, smiles_test, y_test, device='cuda'):
 
-    # 提取表示
     Z_train = molcae_embed(encoder, smiles_train, device=device).cpu().numpy()
     Z_test = molcae_embed(encoder, smiles_test, device=device).cpu().numpy()
     print(Z_train.shape)
@@ -186,13 +178,7 @@ class MoleculeModule(pl.LightningDataModule):
     def get_cache(self):
         return self.cache_files
     def setup(self, stage=None):
-        """
-        加载数据并划分为 train/val。
-        若 stage 为 'test' 或 'predict' 时，也可以单独加载测试集。
-        """
-        # 1. 加载原始数据
-        # zinc_path = 'E:/生信/数据/ZINC'
-        zinc_path = r'E:\生信\scMCP\Data\benchmark_smi'
+        zinc_path = r'\Data\benchmark_smi'
         zinc_files = [f for f in glob.glob(os.path.join(zinc_path, '*.smi'))]
         for zfile in zinc_files:
             print(zfile)
@@ -210,20 +196,16 @@ class MoleculeModule(pl.LightningDataModule):
             tmp = '/'.join(cache['filename'].split('/'))
             self.cache_files.append(tmp)
 
-        # 2. 划分训练集和验证集（例如 95% 训练，5% 验证）
-        #    若您希望固定随机种子保证可重复性
         train_test_split = dataset_dict.train_test_split(test_size=0.05, seed=42)
         self.pubchem_train = train_test_split['train']
         self.pubchem_val = train_test_split['test']
 
-        # 3. 可选：如果有单独的测试集文件，可在此加载
-        #    self.pubchem_test = load_dataset(...)['test']
 
     def train_dataloader(self):
         return DataLoader(
             self.pubchem_train,
             collate_fn=self.data_collector.process, drop_last=True,
-            shuffle=True,           # 训练集需要打乱
+            shuffle=True,         
             **self.train_args
         )
 
@@ -231,7 +213,7 @@ class MoleculeModule(pl.LightningDataModule):
         return DataLoader(
             self.pubchem_val,
             collate_fn=self.data_collector.process, drop_last=True,
-            shuffle=False,          # 验证集不需要打乱
+            shuffle=False,        
             **self.train_args
         )
     def test_dataloader(self):
@@ -329,13 +311,12 @@ class MolGATMAE(pl.LightningModule):
             rep_masked = rep + (rep_masked - rep).detach()
             rep_j_masked = rep_j + (rep_j_masked - rep_j).detach()
 
-            # 互反交叉预测（核心改动）
             recon = self.dec_pred_atoms(rep_masked,
-                                        xjs.edge_index,  # xis的表示预测xjs中被mask的原j
+                                        xjs.edge_index, 
                                         xjs.edge_attr,
                                         masked_node_indices_j)
             recon_j = self.dec_pred_atoms(rep_j_masked,
-                                          xis.edge_index,  # xjs的表示预测xis中被mask的原j
+                                          xis.edge_index,
                                           xis.edge_attr,
                                           masked_node_indices_i)
 
@@ -344,7 +325,6 @@ class MolGATMAE(pl.LightningModule):
             loss_rec_all += self.criterion(xis.node_attr_label[masked_node_indices_i],
                                            recon_j[masked_node_indices_i])
 
-        # 非 remask 的 latent 交叉预测
         pred_node = self.dec_pred_atoms(node_rep,
                                         xjs.edge_index,
                                         xjs.edge_attr,
@@ -392,101 +372,6 @@ class MolGATMAE(pl.LightningModule):
         #     total_loss = total_loss + div_loss
         return {'loss': total_loss}
 
-    # def training_step(self, batch, batch_idx):
-    #     xis, xjs = batch
-    #
-    #     node_rep, zis = self.encoder(xis)
-    #     node_rep_j, zjs = self.encoder(xjs)
-    #
-    #     node_rep = node_rep.clone()
-    #     node_rep_j = node_rep_j.clone()
-    #
-    #     loss_rec_all = 0
-    #     masked_node_indices_i = xis.masked_atom_indices
-    #     masked_node_indices_j = xjs.masked_atom_indices
-    #
-    #     for i in range(self._num_remasking):
-    #         rep = node_rep.clone().detach().requires_grad_(True)
-    #         rep_j = node_rep_j.clone().detach().requires_grad_(True)
-    #
-    #         with torch.no_grad():
-    #             rep_masked, remask_nodes, _ = random_remask(
-    #                 self.encoder.dec_mask_token, rep, xis,
-    #                 self.cur_device, self._remask_rate
-    #             )
-    #             rep_j_masked, remask_nodes_j, _ = random_remask(
-    #                 self.encoder.dec_mask_token, rep_j, xjs,
-    #                 self.cur_device, self._remask_rate
-    #             )
-    #
-    #         rep_masked = rep + (rep_masked - rep).detach()
-    #         rep_j_masked = rep_j + (rep_j_masked - rep_j).detach()
-    #
-    #         # ===== 改为自重建：A 预测 A，B 预测 B =====
-    #         recon = self.dec_pred_atoms(rep_masked,
-    #                                     xis.edge_index,  # 使用自己的边索引
-    #                                     xis.edge_attr,
-    #                                     masked_node_indices_i)  # 预测自己的掩码位置
-    #         recon_j = self.dec_pred_atoms(rep_j_masked,
-    #                                       xjs.edge_index,
-    #                                       xjs.edge_attr,
-    #                                       masked_node_indices_j)
-    #
-    #         loss_rec_all += self.criterion(xis.node_attr_label,
-    #                                        recon[masked_node_indices_i])
-    #         loss_rec_all += self.criterion(xjs.node_attr_label,
-    #                                        recon_j[masked_node_indices_j])
-    #
-    #     # 非 remask 的 latent 自重建
-    #     pred_node = self.dec_pred_atoms(node_rep,
-    #                                     xis.edge_index,  # 使用自己的边信息
-    #                                     xis.edge_attr,
-    #                                     masked_node_indices_i)  # 预测自己的掩码位置
-    #     pred_node_j = self.dec_pred_atoms(node_rep_j,
-    #                                       xjs.edge_index,
-    #                                       xjs.edge_attr,
-    #                                       masked_node_indices_j)
-    #
-    #     # 统一的自重建损失（修复 else 分支错误）
-    #     if self.loss_fn == "sce":
-    #         latent_loss = self.criterion(xis.node_attr_label, pred_node[masked_node_indices_i])
-    #         latent_loss += self.criterion(xjs.node_attr_label, pred_node_j[masked_node_indices_j])
-    #     else:
-    #         latent_loss = self.criterion(pred_node.double()[masked_node_indices_i],
-    #                                      xis.mask_node_label[:, 0])
-    #         latent_loss += self.criterion(pred_node_j.double()[masked_node_indices_j],
-    #                                       xjs.mask_node_label[:, 0])
-    #
-    #     edge_loss = 0.0
-    #     if self.config['mask_edge']:
-    #         masked_edge_index_i = xis.edge_index[:, xis.connected_edge_indices]
-    #         masked_edge_index_j = xjs.edge_index[:, xjs.connected_edge_indices]
-    #
-    #         # 边预测也改为自重建
-    #         edge_rep = node_rep[masked_edge_index_i[0]] + node_rep[masked_edge_index_i[1]]
-    #         pred_edge = self.dec_pred_bonds(edge_rep,
-    #                                         xis.edge_index,  # 自己的边结构
-    #                                         xis.edge_attr,
-    #                                         masked_node_indices_i)
-    #         edge_loss = self.criterion(pred_edge.double(), xis.edge_attr_label)
-    #
-    #         edge_rep_j = node_rep_j[masked_edge_index_j[0]] + node_rep_j[masked_edge_index_j[1]]
-    #         pred_edge_j = self.dec_pred_bonds(edge_rep_j,
-    #                                           xjs.edge_index,
-    #                                           xjs.edge_attr,
-    #                                           masked_node_indices_j)
-    #         edge_loss += self.criterion(pred_edge_j.double(), xjs.edge_attr_label)
-    #
-    #     zis = F.normalize(zis, dim=1)
-    #     zjs = F.normalize(zjs, dim=1)
-    #     if zis.shape[0] != self.nt_xent_criterion.batch_size:
-    #         self.nt_xent_criterion.batch_size = zis.shape[0]
-    #         self.nt_xent_criterion.mask_samples_from_same_repr = \
-    #             self.nt_xent_criterion._get_correlated_mask().type(torch.bool)
-    #
-    #     total_loss = (edge_loss + loss_rec_all
-    #                   + self.nt_xent_criterion(zis, zjs))
-    #     return {'loss': total_loss}
     def training_step(self, batch, batch_idx):
         xis, xjs = batch
 
@@ -496,9 +381,9 @@ class MolGATMAE(pl.LightningModule):
         node_rep_j = node_rep_j.clone()
 
         loss_rec_all = 0
-        masked_node_indices_i = xis.masked_atom_indices  # 全局索引
+        masked_node_indices_i = xis.masked_atom_indices  
         masked_node_indices_j = xjs.masked_atom_indices
-        # ---------- 多次 remask 自重建 ----------
+
         for i in range(self._num_remasking):
             rep = node_rep.clone().detach().requires_grad_(True)
             rep_j = node_rep_j.clone().detach().requires_grad_(True)
@@ -516,23 +401,19 @@ class MolGATMAE(pl.LightningModule):
             rep_masked = rep + (rep_masked - rep).detach()
             rep_j_masked = rep_j + (rep_j_masked - rep_j).detach()
 
-            # 自重建：A 的重掩码表示 → 预测 A 自身的掩码原子
             recon = self.dec_pred_atoms(rep_masked,
-                                        xis.edge_index,  # 改为 A 的边
-                                        xis.edge_attr,  # 改为 A 的边属性
-                                        masked_node_indices_i)  # 改为 A 的掩码索引
-            # 自重建：B 的重掩码表示 → 预测 B 自身的掩码原子
+                                        xis.edge_index, 
+                                        xis.edge_attr, 
+                                        masked_node_indices_i)  
             recon_j = self.dec_pred_atoms(rep_j_masked,
-                                          xjs.edge_index,  # B 的边
-                                          xjs.edge_attr,  # B 的边属性
-                                          masked_node_indices_j)  # B 的掩码索引
+                                          xjs.edge_index,
+                                          xjs.edge_attr,  
+                                          masked_node_indices_j)  
 
-            # 损失对应自身标签
             loss_rec_all += self.criterion(xis.node_attr_label[masked_node_indices_i],
                                            recon[masked_node_indices_i])
             loss_rec_all += self.criterion(xjs.node_attr_label[masked_node_indices_j],
                                            recon_j[masked_node_indices_j])
-        # ---------- 非 remask 的交叉预测 ----------
         pred_node = self.dec_pred_atoms(node_rep,
                                         xjs.edge_index,
                                         xjs.edge_attr,
@@ -542,22 +423,19 @@ class MolGATMAE(pl.LightningModule):
                                           xis.edge_attr,
                                           masked_node_indices_i)
 
-        # 统一为交叉损失（去掉错误的 else 分支）
         latent_loss = self.criterion(xjs.node_attr_label[masked_node_indices_j],
                                      pred_node[masked_node_indices_j])
         latent_loss += self.criterion(xis.node_attr_label[masked_node_indices_i],
                                       pred_node_j[masked_node_indices_i])
 
-        # ---------- 边预测（仅掩码边）----------
         edge_loss = 0.0
         if self.config['mask_edge']:
-            # 视图 A → B
             if xjs.connected_edge_indices.numel() > 0:
                 masked_edge_index_j = xjs.edge_index[:, xjs.connected_edge_indices]
                 edge_rep = node_rep[masked_edge_index_j[0]] + node_rep[masked_edge_index_j[1]]
                 pred_edge = self.dec_pred_bonds(edge_rep, xjs.edge_index, xjs.edge_attr, masked_node_indices_j)
                 edge_loss += self.criterion(pred_edge, xjs.edge_attr_label[xjs.connected_edge_indices])
-            # 视图 B → A
+       
             if xis.connected_edge_indices.numel() > 0:
                 masked_edge_index_i = xis.edge_index[:, xis.connected_edge_indices]
                 edge_rep_j = node_rep_j[masked_edge_index_i[0]] + node_rep_j[masked_edge_index_i[1]]
@@ -567,11 +445,8 @@ class MolGATMAE(pl.LightningModule):
 
         zis = F.normalize(zis, dim=1)
         zjs = F.normalize(zjs, dim=1)
-        contrast_loss = self.nt_xent_criterion(zis, zjs)  # 若要保留则取消注释
-
-        # 总损失（这里将对比损失权重设为 0，符合理论）
+        contrast_loss = self.nt_xent_criterion(zis, zjs)  
         total_loss =edge_loss +latent_loss+ loss_rec_all + contrast_loss
-        # total_loss += contrast_loss  # 如需保留可加回
 
         return {'loss': total_loss}
     def _init_weights(self, module):
@@ -620,87 +495,6 @@ class MolGATMAE(pl.LightningModule):
         )
         return optimizer
 
-    # def training_step(self, batch, batch_idx):
-    #     xis, xjs=batch
-
-    #     node_rep,zis = self.encoder(xis)
-    #     #random remask
-
-    #     node_rep_j,zjs = self.encoder(xjs)
-        
-    #     node_rep = node_rep.clone() 
-    #     node_rep_j = node_rep_j.clone()
-    #     loss_rec_all = 0
-    #     masked_node_indices_i = xis.masked_atom_indices
-    #     masked_node_indices_j = xjs.masked_atom_indices
-
-    #     for i in range(self._num_remasking):
-    #         rep = node_rep.clone().detach().requires_grad_(True)
-    #         rep_j = node_rep_j.clone().detach().requires_grad_(True)
-    #         with torch.no_grad():
-    #             rep_masked, remask_nodes, _ = random_remask(
-    #                 self.encoder.dec_mask_token,
-    #                 rep,
-    #                 xis,
-    #                self.cur_device,
-    #                 self._remask_rate
-    #             )
-                
-    #             rep_j_masked, remask_nodes_j, _ = random_remask(
-    #                 self.encoder.dec_mask_token,
-    #                 rep_j,
-    #                 xjs,
-    #                self.cur_device,
-    #                 self._remask_rate
-    #             )
-    #         rep_masked = rep + (rep_masked - rep).detach()
-    #         rep_j_masked = rep_j + (rep_j_masked - rep_j).detach()
-
-    #         recon = self.dec_pred_atoms(rep_masked, xis.edge_index, xis.edge_attr, masked_node_indices_i)
-    #         recon_j = self.dec_pred_atoms(rep_j_masked, xjs.edge_index, xjs.edge_attr, masked_node_indices_j)
-    #         x_init = xis.node_attr_label[masked_node_indices_i]
-    #         x_rec = recon[masked_node_indices_i]
-    #         loss_rec_all = loss_rec_all + self.criterion(x_init, x_rec)
-    #         x_init = xis.node_attr_label[masked_node_indices_j]
-    #         x_rec = recon_j[masked_node_indices_j]
-    #         loss_rec_all = loss_rec_all + self.criterion(x_init, x_rec)
-
-    #     node_attr_label = xis.node_attr_label
-    #     masked_node_indices = xis.masked_atom_indices
-    #     pred_node =  self.dec_pred_atoms(node_rep, xis.edge_index, xis.edge_attr, masked_node_indices)
-
-
-    #     node_attr_label_j = xjs.node_attr_label
-    #     masked_node_indices_j = xjs.masked_atom_indices
-    #     pred_node_j =  self.dec_pred_atoms(node_rep_j, xjs.edge_index, xjs.edge_attr, masked_node_indices_j)
-    #     # loss = criterion(pred_node.double(), batch.mask_node_label[:,0])
-    #     if self.loss_fn == "sce":
-    #         latent_loss = self.criterion(node_attr_label, pred_node[masked_node_indices])
-    #         latent_loss = latent_loss + self.criterion(node_attr_label_j, pred_node_j[masked_node_indices_j])
-    #     else:
-    #         latent_loss = self.criterion(pred_node.double()[masked_node_indices], xis.mask_node_label[:, 0])
-
-    #     if self.config['mask_edge']:
-    #         masked_edge_index = xis.edge_index[:, xis.connected_edge_indices]
-    #         edge_rep = node_rep[masked_edge_index[0]] + node_rep[masked_edge_index[1]]
-    #         pred_edge = self.dec_pred_bonds(edge_rep, xis.edge_index, xis.edge_attr, masked_node_indices)
-    #         edge_loss =  self.criterion(pred_edge.double(), xis.edge_attr_label)
-
-    #         masked_edge_index_j = xjs.edge_index[:, xjs.connected_edge_indices]
-    #         edge_rep_j = node_rep[masked_edge_index_j[0]] + node_rep[masked_edge_index_j[1]]
-    #         pred_edge_j = self.dec_pred_bonds(edge_rep_j, xjs.edge_index, xjs.edge_attr, masked_node_indices_j)
-    #         edge_loss = edge_loss + self.criterion(pred_edge_j.double(), xjs.edge_attr_label)
-    #         # acc_edge = compute_accuracy(pred_edge, batch.mask_edge_label[:,0])
-    #         # acc_edge_accum += acc_edge
-
-
-    #     zis = F.normalize(zis, dim=1)
-    #     zjs = F.normalize(zjs, dim=1)
-    #     if(zis.shape[0]!=self.nt_xent_criterion.batch_size):
-    #         self.nt_xent_criterion.batch_size=zis.shape[0]
-    #         self.nt_xent_criterion.mask_samples_from_same_repr = self.nt_xent_criterion._get_correlated_mask().type(torch.bool)
-    #     total_loss = edge_loss + latent_loss + loss_rec_all + self.nt_xent_criterion(zis, zjs)
-    #     return {'loss':total_loss}
 
 from pytorch_lightning.callbacks import ModelCheckpoint
 import torch
