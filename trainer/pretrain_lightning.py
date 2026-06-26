@@ -510,47 +510,12 @@ def load_smiles_from_files(filepaths):
                     continue
                 smiles_list.append(smiles)
     return smiles_list
-# def get_nccl_socket_ifname():
-#     ipa = subprocess.run(['ip', 'a'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-#     lines = ipa.stdout.decode('utf-8').split('\n')
-#     all_names = []
-#     name = None
-#     for line in lines:
-#         if line and not line[0] == ' ':
-#             name = line.split(':')[1].strip()
-#             continue
-#         if 'link/infiniband' in line:
-#             all_names.append(name)
-#     os.environ['NCCL_SOCKET_IFNAME'] = 'en,eth,em,bond'
-# # ','.join(all_names)
-# def fix_infiniband():
-#     # os.environ['NCCL_SOCKET_IFNAME'] = "^lo,docker,virbr,vmnet,vboxnet,wl,ww,ppp,bond"
 
-#     # ifname = os.environ.get('NCCL_SOCKET_IFNAME', None)
-#     # if ifname is None:
-#     #     os.environ['NCCL_SOCKET_IFNAME'] = '^lo,docker0'
-
-#     get_nccl_socket_ifname()
-#     os.environ['NCCL_IB_CUDA_SUPPORT'] = '1'
-#     ibv = subprocess.run('ibv_devinfo', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-#     lines = ibv.stdout.decode('utf-8').split('\n')
-#     exclude = ''
-#     for line in lines:
-#         if 'hca_id:' in line:
-#             name = line.split(':')[1].strip()
-#         if '\tport:' in line:
-#             port = line.split(':')[1].strip()
-#         if 'link_layer:' in line and 'Ethernet' in line:
-#             exclude = exclude + f'{name}:{port},'
-#     if exclude:
-#         exclude = '^' + exclude[:-1]
-#         # print(exclude)
-#         os.environ['NCCL_IB_HCA'] = exclude
 def get_nccl_socket_ifname():
-    return ""  # 直接返回空，不执行Linux命令
+    return "" 
 
 def fix_infiniband():
-    pass  # 什么都不做
+    pass  
 def main():
     for var in ["MASTER_ADDR", "MASTER_PORT", "NODE_RANK", "LOCAL_RANK"]:
         os.environ.pop(var, None)
@@ -596,7 +561,7 @@ def main():
         'loss_fn':'sce',
         'restart_path':'',
         'max_len':202,
-        'lambda_divergence': 0.0,  # 默认值，扫描时外部覆写
+        'lambda_divergence': 0.0,  
     }
     import scanpy as sc
     import getpass
@@ -625,21 +590,18 @@ def main():
         print("Using " + str(torch.cuda.device_count()) + " GPUs---------------------------------------------------------------------")
     train_config = {'batch_size':config['batch_size'], 'num_workers':config['num_workers'], 'pin_memory':True}
     torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
-    # 需要扫描的 λ 值列表
+  
     lambda_values = [0]
 
-    # 存储每个 λ 的结果
     results = []
 
-    # 基础配置（不包含 lambda_divergence，每个循环动态加入）
-    base_config = config.copy()  # 使用您已有的 dict
+    base_config = config.copy() 
 
     for lam in lambda_values:
         print(f"\n{'='*40}\nTraining with λ = {lam}\n{'='*40}")
         current_config = base_config.copy()
         current_config['lambda_divergence'] = lam
 
-        # 重新创建数据模块（避免缓存冲突）
         data_loader = MoleculeModule(current_config['max_len'], None, train_config)
         data_loader.setup()
         cachefiles = data_loader.get_cache()
@@ -650,16 +612,8 @@ def main():
             verbose=True  # Print information about checkpoint saving
         )
         try:
-            # molgatmae = MolGATMAE(current_config)
-            checkpoint_path = 'E:\生信\scMCP\DrugGCL\\version_160\checkpoints\epoch=0-step=4688.ckpt'
+            checkpoint_path = '\version_160\checkpoints\epoch=0-step=4688.ckpt'
 
-            # 手动加载完整 checkpoint 字典（包含模型参数和所有状态）
-            # checkpoint = torch.load(checkpoint_path, weights_only=False, map_location='cuda')
-
-            # 提取模型参数
-            # model_state = checkpoint.get('state_dict', checkpoint)  # 兼容不同保存方式
-
-            # 实例化模型并加载参数
             molgatmae = MolGATMAE(current_config)
             # molgatmae.load_state_dict(model_state, strict=True)
             molgatmae.to('cuda')
@@ -672,7 +626,6 @@ def main():
                 continue
             else:
                 raise
-        # Trainer（为每个 λ 创建独立日志目录）
         trainer = pl.Trainer(
             default_root_dir=f'./lambda_{lam:.4f}/',
             max_epochs=current_config['epochs'],
@@ -692,13 +645,11 @@ def main():
             print(f"Training failed for λ={lam}: {exp}")
             rank_zero_warn('Error caught, cleaning up')
             remove_tree(cachefiles)
-            continue  # 跳过当前 λ，继续下一个
+            continue  
 
-        # ---------- 训练完成后计算表示差异 D 和验证损失 ----------
         molgatmae.eval()
         molgatmae.to('cuda')
         val_loader = data_loader.val_dataloader()
-        # 1. 计算表示差异 D（取训练集前30个batch）
         all_D = []
         with torch.no_grad():
             # train_loader_for_D = train_loader.train_dataloader()
@@ -715,48 +666,26 @@ def main():
 
         total_val_loss = 0.0
         num_val_batches = 0
-        # with torch.no_grad():
-        #     for i, batch in enumerate(val_loader):
-        #         xis, xjs = batch
-        #         xis, xjs = xis.to('cuda'), xjs.to('cuda')
-        #         # 方式一：直接调用模型的 contrastive_loss（如果实现了）
-        #         if hasattr(molgatmae, 'contrastive_loss'):
-        #             zis, _ = molgatmae.encoder(xis)
-        #             zjs, _ = molgatmae.encoder(xjs)
-        #             loss = molgatmae.contrastive_loss(zis, zjs)
-        #         # 方式二：调用 training_step（注意需要 batch_idx，且可能依赖 Trainer 状态）
-        #         else:
-        #             # 假设 training_step 不依赖 self.trainer 的属性
-        #             loss = molgatmae.validation_step(batch, i)  # i 作为 batch_idx
-        #         total_val_loss += loss['loss'].item()
-        #         num_val_batches += 1
-        # val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else float('nan')
-
         test_mae = evaluate_linear_probe(
             molgatmae.encoder,
             smiles_train, y_train,
             smiles_test, y_test,
             device='cuda'
         )
-        # 存储结果
         results.append({'lambda': lam, 'mean_D': mean_D,  'test_mae': test_mae})
         print(f"λ={lam:.4f}, mean D={mean_D:.4f},  test_MAE={test_mae:.4f}")
 
-        # 清理缓存（只执行一次）
         remove_tree(cachefiles)
 
-        # 可选：强制清理 GPU 缓存和 DataLoader 残留
         del train_loader, val_loader
         torch.cuda.empty_cache()
         import gc;
         gc.collect()
 
-    # 打印结果表格
     print("\n===== Scan Results =====")
     for r in results:
         print(f"λ={r['lambda']:.4f}, D={r['mean_D']:.4f}")
 
-    # 可选：绘制 D - λ 曲线
     import matplotlib.pyplot as plt
     lambs = [r['lambda'] for r in results]
     Ds = [r['mean_D'] for r in results]
