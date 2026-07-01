@@ -2,7 +2,6 @@
 # Implicit conformational perception via geometry-aware
 reciprocal masked molecular learning
 
-[![Paper](https://img.shields.io/badge/Paper-Nat._Comput._Sci.-blue.svg)](https://doi.org/10.1038/xxx) 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee8c00.svg)](https://pytorch.org/)
 [![PyG](https://img.shields.io/badge/PyG-2.3+-3c7fb0.svg)](https://pytorch-geometric.readthedocs.io/)
@@ -70,12 +69,12 @@ python trainer/pretrain_lightning.py \
 from model.rmmol_gnn_model import RMMol
 import torch
 
-# Initialize model
+Initialize model
 model = RMMol.load_from_checkpoint("checkpoints/rmmol_pretrained.ckpt")
 model.eval()
 
-# Extract representations
-# z = model.get_molecular_embedding(graph_data)
+Extract representations
+z = model.get_molecular_embedding(graph_data)
 
 ## 📊 Reproducing Activity Cliff & LNP Results
 To reproduce the 30-target Activity Cliff analysis and the LNP delivery efficiency linear probing results presented in the paper, please refer to the Jupyter notebooks in the notebooks/ directory:
