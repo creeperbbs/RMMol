@@ -11,7 +11,6 @@ reciprocal masked molecular learning
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee8c00.svg)](https://pytorch.org/)
 [![PyG](https://img.shields.io/badge/PyG-2.3+-3c7fb0.svg)](https://pytorch-geometric.readthedocs.io/)
 
-<<<<<<< HEAD
 RMMol is a self-supervised molecular pre-training framework for learning graph representations that preserve local chemistry and implicit conformational cues from 2D molecular graphs. The repository includes reciprocal masked molecular learning, downstream embedding extraction, activity cliff utilities, lipid physical proxies, and a Functional Group Knockout Perturbation (FGKP) toolkit for interpretable SAR analysis.
 
 ## Highlights
