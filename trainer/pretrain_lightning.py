@@ -1,980 +1,464 @@
-# -*- coding: utf-8 -*-
-# @Author: Hongzhi Yao
-# @Date:   2025-06-21 09:15:55
-# @Last Modified by:   Hongzhi Yao
-# @Last Modified time: 2025-7-5 18:33:14
-import os
+"""PyTorch Lightning pre-training entry point for RMMol."""
+
+from __future__ import annotations
+
+import argparse
+import random
 import shutil
 import sys
 from functools import partial
-import argparse
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-import pandas as pd
-import torch
-import random
-torch.cuda.empty_cache()
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
-from torch.utils.data import DataLoader
-from datasets import load_dataset, concatenate_datasets, load_from_disk
-import yaml
-import getpass
 import numpy as np
-from datetime import datetime
-import torch.optim as optim
-import torch.nn.functional as F
-from torch import nn
-from torch.utils.tensorboard import SummaryWriter
-from torch.optim.lr_scheduler import CosineAnnealingLR
-from tqdm import tqdm
-import torch.distributed as dist
+import pandas as pd
 import pytorch_lightning as pl
-import os
-from ..model.rmmol_gnn_model import GNNDecoder, GNN
-from ..utils.loss import NTXentLoss, sce_loss
-from torch.cuda.amp import autocast, GradScaler
-from pytorch_lightning.utilities import rank_zero_warn, rank_zero_only, seed
-from pytorch_lightning.callbacks import LearningRateMonitor
-apex_support = False
-# from apex import optimizers
-from ..loader.loader import MoleculeProcessor,molcae_embed
-from torch.distributed import broadcast_object_list
-import subprocess
-
-import glob
-SEED = 2025
-seed.seed_everything(SEED)
-# try:
-#     sys.path.append('./apex')
-#     # from apex import amp
-#
-#     apex_support = True
-# except:
-#     print("Please install apex for mixed precision training from: https://github.com/NVIDIA/apex")
-#     apex_support = False
-
-class CheckpointEveryNSteps(pl.Callback):
-    """
-        Save a checkpoint every N steps, instead of Lightning's default that checkpoints
-        based on validation loss.
-    """
-
-    def __init__(self, save_step_frequency=-1,
-        prefix="N-Step-Checkpoint",
-        use_modelcheckpoint_filename=False,
-        ):
-        """
-        Args:
-        save_step_frequency: how often to save in steps
-        prefix: add a prefix to the name, only used if
-        use_modelcheckpoint_filename=False
-        """
-        self.save_step_frequency = save_step_frequency
-        self.prefix = prefix
-        self.use_modelcheckpoint_filename = use_modelcheckpoint_filename
-    def on_batch_end(self, trainer: pl.Trainer, _):
-        """ Check if we should save a checkpoint after every train batch """
-        epoch = trainer.current_epoch
-        global_step = trainer.global_step
-
-        if global_step % self.save_step_frequency == 0 and self.save_step_frequency > 10:
-
-            if self.use_modelcheckpoint_filename:
-                filename = trainer.checkpoint_callback.filename
-            else:
-                filename = f"{self.prefix}_{epoch}_{global_step}.ckpt"
-            ckpt_path = os.path.join(trainer.checkpoint_callback.dirpath, filename)
-            trainer.save_checkpoint(ckpt_path)
-class ModelCheckpointAtEpochEnd(pl.Callback):
-    def on_epoch_end(self, trainer, pl_module):
-        metrics = trainer.callback_metrics
-        metrics['epoch'] = trainer.current_epoch
-        if trainer.disable_validation:
-            trainer.checkpoint_callback.on_validation_end(trainer, pl_module)
-
-
+import torch
+import torch.nn.functional as F
+import yaml
+from datasets import load_dataset
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.utilities import rank_zero_only
 from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error
 from sklearn.preprocessing import StandardScaler
-import torch
+from torch.utils.data import DataLoader
+
+try:
+    from ..loader.loader import MoleculeProcessor, molcae_embed
+    from ..model.rmmol_gnn_model import GNN, GNNDecoder
+    from ..utils.loss import TopologyAwareNTXentLoss, sce_loss
+except ImportError:
+    PROJECT_ROOT = Path(__file__).resolve().parents[1]
+    sys.path.insert(0, str(PROJECT_ROOT))
+    from loader.loader import MoleculeProcessor, molcae_embed
+    from model.rmmol_gnn_model import GNN, GNNDecoder
+    from utils.loss import TopologyAwareNTXentLoss, sce_loss
 
 
-# ---------- QM9 数据加载函数 ----------
-def load_qm9_data(csv_path, smiles_col='smiles', target_cols=None):
-    """读取 QM9 CSV 文件，返回 smiles 列表和目标值 numpy 数组"""
+DEFAULT_CONFIG: Dict[str, Any] = {
+    "seed": 2025,
+    "batch_size": 128,
+    "epochs": 1,
+    "num_workers": 0,
+    "pin_memory": True,
+    "valid_size": 0.05,
+    "init_lr": 3e-4,
+    "weight_decay": 1e-5,
+    "num_layer": 6,
+    "emb_dim": 1024,
+    "feat_dim": 768,
+    "dropout_ratio": 0.0,
+    "gnn_type": "gin",
+    "JK": "last",
+    "mask_edge": True,
+    "temperature": 0.1,
+    "use_cosine_similarity": True,
+    "alpha_l": 1.0,
+    "num_remasking": 2,
+    "remask_rate": 0.5,
+    "lambda_divergence": 0.0,
+    "contrastive_weight": 1.0,
+    "output_dir": "runs/rmmol_pretrain",
+    "save_top_k": -1,
+    "precision": "32-true",
+    "accelerator": "auto",
+    "devices": "auto",
+}
+
+QM9_TARGETS = ["mu", "alpha", "homo", "lumo", "gap", "r2", "zpve", "u0", "u298", "h298", "g298", "cv"]
+
+
+def load_config(config_path: Optional[str]) -> Dict[str, Any]:
+    """Load YAML config and merge it with defaults."""
+    config = DEFAULT_CONFIG.copy()
+    if config_path:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
+        config.update(loaded)
+    return config
+
+
+def resolve_smiles_files(data_path: str) -> List[str]:
+    """Resolve a data file, directory, or comma-separated file list."""
+    if not data_path:
+        raise ValueError("data_path is required.")
+
+    parts = [part.strip() for part in data_path.split(",") if part.strip()]
+    files: List[Path] = []
+    for part in parts:
+        path = Path(part)
+        if path.is_dir():
+            files.extend(sorted(path.glob("*.smi")))
+            files.extend(sorted(path.glob("*.txt")))
+            files.extend(sorted(path.glob("*.csv")))
+        elif path.is_file():
+            files.append(path)
+        else:
+            raise FileNotFoundError(f"Data path does not exist: {path}")
+
+    resolved = [str(path) for path in files]
+    if not resolved:
+        raise FileNotFoundError(f"No SMILES files were found under: {data_path}")
+    return resolved
+
+
+def load_qm9_data(
+    csv_path: str,
+    smiles_col: str = "smiles",
+    target_cols: Optional[Sequence[str]] = None,
+) -> Tuple[List[str], np.ndarray]:
+    """Read a QM9-style CSV into SMILES and target arrays."""
+    target_cols = list(target_cols or QM9_TARGETS)
     df = pd.read_csv(csv_path)
-    smiles = df[smiles_col].tolist()
-    if target_cols is None:
-        # 默认的 12 个回归目标
-        target_cols = ['mu', 'alpha', 'homo', 'lumo', 'gap', 'r2', 'zpve', 'u0', 'u298', 'h298', 'g298', 'cv']
+    missing = [col for col in [smiles_col, *target_cols] if col not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in {csv_path}: {missing}")
+    smiles = df[smiles_col].astype(str).tolist()
     targets = df[target_cols].values.astype(np.float32)
     return smiles, targets
 
 
-# 指定三个文件路径
-train_csv = r'E:\生信\scMCP\GraphWorld\MOMDGDP-main\dataset\smiles\qm9\qm9_small_train.csv'
-valid_csv = r'E:\生信\scMCP\GraphWorld\MOMDGDP-main\dataset\smiles\qm9\qm9_small_valid.csv'
-test_csv = r'E:\生信\scMCP\GraphWorld\MOMDGDP-main\dataset\smiles\qm9\qm9_small_test.csv'
-
-# 加载数据
-smiles_train, y_train_raw = load_qm9_data(train_csv)
-smiles_valid, y_valid_raw = load_qm9_data(valid_csv)
-smiles_test, y_test_raw = load_qm9_data(test_csv)
-
-# ---------- 目标值标准化（基于训练集） ----------
-scaler = StandardScaler()
-y_train = scaler.fit_transform(y_train_raw)
-y_valid = scaler.transform(y_valid_raw)
-y_test = scaler.transform(y_test_raw)
-
-
-def evaluate_linear_probe(encoder, smiles_train, y_train, smiles_test, y_test, device='cuda'):
-
-    # 提取表示
-    Z_train = molcae_embed(encoder, smiles_train, device=device).cpu().numpy()
-    Z_test = molcae_embed(encoder, smiles_test, device=device).cpu().numpy()
-    print(Z_train.shape)
+def evaluate_linear_probe(
+    encoder: torch.nn.Module,
+    smiles_train: Sequence[str],
+    y_train: np.ndarray,
+    smiles_test: Sequence[str],
+    y_test: np.ndarray,
+    device: str = "cuda",
+) -> float:
+    """Fit a ridge probe on frozen embeddings and return mean MAE."""
+    z_train = molcae_embed(encoder, smiles_train, device=device).cpu().numpy()
+    z_test = molcae_embed(encoder, smiles_test, device=device).cpu().numpy()
     maes = []
-    for i in range(y_train.shape[1]):
+    for target_idx in range(y_train.shape[1]):
         reg = Ridge(alpha=1.0)
-        reg.fit(Z_train, y_train[:, i])
-        pred = reg.predict(Z_test)
-        mae = mean_absolute_error(y_test[:, i], pred)
-        maes.append(mae)
-    return np.mean(maes)
-@rank_zero_only
-def remove_tree(cachefiles):
-    if type(cachefiles) == type([]):
-        #if cachefiles are identical remove all but one file path
-        cachefiles = list(set(cachefiles))
-        for cache in cachefiles:
-            shutil.rmtree(cache)
-    else:
-        shutil.rmtree(cachefiles)
+        reg.fit(z_train, y_train[:, target_idx])
+        pred = reg.predict(z_test)
+        maes.append(mean_absolute_error(y_test[:, target_idx], pred))
+    return float(np.mean(maes))
 
-def random_remask(dec_mask_token, rep, x, device, remask_rate=0.5):
-    num_nodes = x.num_nodes
-    perm = torch.randperm(num_nodes,device = device)
-    num_remask_nodes = int(remask_rate * num_nodes)
-    remask_nodes = perm[:num_remask_nodes]
-    
-    rep_new = torch.zeros_like(rep)
-    rep_new.copy_(rep)
-    
-    mask = torch.zeros_like(rep_new, dtype=torch.bool)
-    mask[remask_nodes] = True
-    
-    rep_new = torch.where(
-        mask,
-        dec_mask_token.expand_as(rep_new),  
-        rep_new
-    )
-    
-    return rep_new, remask_nodes, None
+
+def random_remask(
+    dec_mask_token: torch.Tensor,
+    rep: torch.Tensor,
+    data: Any,
+    device: torch.device,
+    remask_rate: float = 0.5,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Replace a random subset of node representations with the decoder mask token."""
+    num_nodes = data.num_nodes
+    num_remask_nodes = max(1, int(remask_rate * num_nodes))
+    remask_nodes = torch.randperm(num_nodes, device=device)[:num_remask_nodes]
+    rep_new = rep.clone()
+    rep_new[remask_nodes] = dec_mask_token.to(device=device, dtype=rep.dtype)
+    return rep_new, remask_nodes
+
+
+@rank_zero_only
+def remove_tree(cache_files: Iterable[str]) -> None:
+    """Remove temporary Hugging Face dataset cache files when requested."""
+    for cache_file in set(cache_files):
+        cache_path = Path(cache_file)
+        if cache_path.exists():
+            shutil.rmtree(cache_path, ignore_errors=True)
+
+
+class CheckpointEveryNSteps(pl.Callback):
+    """Save a checkpoint every N optimizer steps."""
+
+    def __init__(
+        self,
+        save_step_frequency: int = -1,
+        prefix: str = "step",
+        use_modelcheckpoint_filename: bool = False,
+    ):
+        self.save_step_frequency = save_step_frequency
+        self.prefix = prefix
+        self.use_modelcheckpoint_filename = use_modelcheckpoint_filename
+
+    def on_train_batch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule, outputs: Any, batch: Any, batch_idx: int) -> None:
+        if self.save_step_frequency <= 0 or trainer.global_step % self.save_step_frequency != 0:
+            return
+        callback = trainer.checkpoint_callback
+        if callback is None or callback.dirpath is None:
+            return
+        filename = callback.filename if self.use_modelcheckpoint_filename else f"{self.prefix}_{trainer.current_epoch}_{trainer.global_step}.ckpt"
+        trainer.save_checkpoint(str(Path(callback.dirpath) / filename))
+
 
 class MoleculeModule(pl.LightningDataModule):
-    def __init__(self,  max_len, data_path, train_args):
+    """Data module for SMILES-only self-supervised pre-training."""
+
+    def __init__(self, data_path: str, config: Dict[str, Any]):
         super().__init__()
-        self.data_path = ['pubchem']
-        self.train_args = train_args  # dict with keys {'batch_size', 'shuffle', 'num_workers', 'pin_memory'}
-        print(train_args)
-        self.data_collector = MoleculeProcessor()
-        
-        
-    def prepare_data(self):
-        pass
-
-    def get_cache(self):
-        return self.cache_files
-    def setup(self, stage=None):
-        """
-        加载数据并划分为 train/val。
-        若 stage 为 'test' 或 'predict' 时，也可以单独加载测试集。
-        """
-        # 1. 加载原始数据
-        # zinc_path = 'E:/生信/数据/ZINC'
-        zinc_path = r'E:\生信\scMCP\Data\benchmark_smi'
-        zinc_files = [f for f in glob.glob(os.path.join(zinc_path, '*.smi'))]
-        for zfile in zinc_files:
-            print(zfile)
-        data_path = {'train': zinc_files}
-        dataset_dict = load_dataset(
-            './zinc_script.py',
-            data_files=data_path,
-            cache_dir=os.path.join('E:/生信/scMCP/DrugGCL/tmp', getpass.getuser(), 'zinc'),
-            split='train'
-        )
-
-        # 记录缓存路径（原始实现）
-        self.cache_files = []
-        for cache in dataset_dict.cache_files:
-            tmp = '/'.join(cache['filename'].split('/'))
-            self.cache_files.append(tmp)
-
-        # 2. 划分训练集和验证集（例如 95% 训练，5% 验证）
-        #    若您希望固定随机种子保证可重复性
-        train_test_split = dataset_dict.train_test_split(test_size=0.05, seed=42)
-        self.pubchem_train = train_test_split['train']
-        self.pubchem_val = train_test_split['test']
-
-        # 3. 可选：如果有单独的测试集文件，可在此加载
-        #    self.pubchem_test = load_dataset(...)['test']
-
-    def train_dataloader(self):
-        return DataLoader(
-            self.pubchem_train,
-            collate_fn=self.data_collector.process, drop_last=True,
-            shuffle=True,           # 训练集需要打乱
-            **self.train_args
-        )
-
-    def val_dataloader(self):
-        return DataLoader(
-            self.pubchem_val,
-            collate_fn=self.data_collector.process, drop_last=True,
-            shuffle=False,          # 验证集不需要打乱
-            **self.train_args
-        )
-    def test_dataloader(self):
-        return []
-class MolGATMAE(pl.LightningModule):
-    
-    def __init__(self,  config):
-        super().__init__() 
+        self.data_path = data_path
         self.config = config
-        self.lambda_divergence = config.get('lambda_divergence', 0.0)
-        self._num_remasking =2
-        self._remask_rate=0.5
-        self.loss_fn="sce"
-        NUM_NODE_ATTR = 119+4+7+12+10+12+8
-        NUM_BOND_ATTR = 5 + 3 + 3 + 3
-        self.cur_device = 'cuda' 
-        self.encoder = GNN(num_layer=self.config['num_layer'], emb_dim=self.config['emb_dim'],
-                    JK=self.config['JK'],feat_dim=self.config['feat_dim'], drop_ratio=self.config['dropout_ratio'],
-                    gnn_type='gin',degree_list=[0, 1, 2, 3, 4, 5 ,6 ,7, 8, 9, 10],
-                    batch_size=self.config['batch_size'],device=self.cur_device).double()
-        # self.encoder = self.GNN(x, edge_index, edge_attr)
-        # self.encoder = GNN(num_layer=self.config['num_layer'], emb_dim=self.config['emb_dim'],
-        #             JK=self.config['JK'],feat_dim=self.config['feat_dim'], drop_ratio=self.config['dropout_ratio'],
-        #             gnn_type='degree',degree_list=[0, 1, 2, 3, 4, 5 ,6 ,7, 8, 9, 10],
-        #             batch_size=self.config['batch_size'],device=self.cur_device).double()
-        if self.config['input_model_file'] is not None and self.config['input_model_file'] != "":
-            # model.load_state_dict(torch.load(self.config['input_model_file']))
-            # print("Resume training from:", self.config['input_model_file'])
-            self.resume = True
-        else:
-            self.resume = False
-        self.dec_pred_atoms = GNNDecoder(self.config['emb_dim'], NUM_NODE_ATTR, JK=self.config['JK'], gnn_type=self.config['gnn_type']).double()
-        self.dec_pred_bonds = GNNDecoder(self.config['emb_dim'], NUM_BOND_ATTR, JK=self.config['JK'], gnn_type='linear').double()
-            
-        self.nt_xent_criterion = NTXentLoss(self.cur_device, config['batch_size'], config['temperature'], config['use_cosine_similarity']).double()
-        alpha_l=1.0
-        self.criterion = partial(sce_loss, alpha=alpha_l)
-    def on_save_checkpoint(self, checkpoint):
-        #save RNG states each time the model and states are saved
-        out_dict = dict()
-        out_dict['torch_state']=torch.get_rng_state()
-        out_dict['cuda_state']=torch.cuda.get_rng_state()
-        if np:
-            out_dict['numpy_state']=np.random.get_state()
-        if random:
-            out_dict['python_state']=random.getstate()
-        checkpoint['rng'] = out_dict
+        self.data_collector = MoleculeProcessor(
+            mask_rate=float(config.get("mask_rate", 0.25)),
+            mask_edge=float(config.get("mask_edge_rate", 0.25)),
+        )
+        self.cache_files: List[str] = []
 
-    def on_load_checkpoint(self, checkpoint):
-        #load RNG states each time the model and states are loaded from checkpoint
-        rng = checkpoint['rng']
-        for key, value in rng.items():
-            if key =='torch_state':
-                torch.set_rng_state(value)
-            elif key =='cuda_state':
-                torch.cuda.set_rng_state(value)
-            elif key =='numpy_state':
-                np.random.set_state(value)
-            elif key =='python_state':
-                random.setstate(value)
-            else:
-                print('unrecognized state')
-    # def on_validation_epoch_end(self, outputs):
-    #
-    #     avg_loss = torch.tensor([output['loss'] for output in outputs]).mean()
-    #     loss = {'loss': avg_loss.item()}
-    #     self.log('validation_loss', loss['loss'])
-    def validation_step(self, batch, batch_idx):
+    def setup(self, stage: Optional[str] = None) -> None:
+        files = resolve_smiles_files(self.data_path)
+        loader_script = Path(__file__).resolve().parents[1] / "loader" / "zinc_script.py"
+        dataset = load_dataset(
+            str(loader_script),
+            data_files={"train": files},
+            cache_dir=self.config.get("cache_dir"),
+            split="train",
+        )
+        self.cache_files = [cache["filename"] for cache in dataset.cache_files]
+        split = dataset.train_test_split(test_size=float(self.config["valid_size"]), seed=int(self.config["seed"]))
+        self.train_dataset = split["train"]
+        self.val_dataset = split["test"]
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.train_dataset,
+            batch_size=int(self.config["batch_size"]),
+            num_workers=int(self.config["num_workers"]),
+            pin_memory=bool(self.config.get("pin_memory", True)),
+            collate_fn=self.data_collector.process,
+            shuffle=True,
+            drop_last=True,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.val_dataset,
+            batch_size=int(self.config["batch_size"]),
+            num_workers=int(self.config["num_workers"]),
+            pin_memory=bool(self.config.get("pin_memory", True)),
+            collate_fn=self.data_collector.process,
+            shuffle=False,
+            drop_last=True,
+        )
+
+
+class MolGATMAE(pl.LightningModule):
+    """RMMol masked molecular autoencoder with reciprocal reconstruction."""
+
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__()
+        self.save_hyperparameters(config)
+        self.config = config
+        self.cur_device_name = "cuda" if torch.cuda.is_available() else "cpu"
+        self.loss_fn = config.get("loss_fn", "sce")
+        self.num_remasking = int(config.get("num_remasking", 2))
+        self.remask_rate = float(config.get("remask_rate", 0.5))
+        self.lambda_divergence = float(config.get("lambda_divergence", 0.0))
+        self.contrastive_weight = float(config.get("contrastive_weight", 1.0))
+
+        num_node_attr = 119 + 4 + 7 + 12 + 10 + 12 + 8
+        num_bond_attr = 5 + 3 + 3 + 3
+        self.encoder = GNN(
+            num_layer=int(config["num_layer"]),
+            emb_dim=int(config["emb_dim"]),
+            JK=config["JK"],
+            feat_dim=int(config["feat_dim"]),
+            drop_ratio=float(config["dropout_ratio"]),
+            gnn_type=config.get("gnn_type", "gin"),
+            degree_list=list(range(11)),
+            batch_size=int(config["batch_size"]),
+            device=torch.device(self.cur_device_name),
+        ).double()
+        self.dec_pred_atoms = GNNDecoder(
+            int(config["emb_dim"]),
+            num_node_attr,
+            JK=config["JK"],
+            gnn_type=config.get("gnn_type", "gin"),
+        ).double()
+        self.dec_pred_bonds = GNNDecoder(
+            int(config["emb_dim"]),
+            num_bond_attr,
+            JK=config["JK"],
+            gnn_type="linear",
+        ).double()
+        self.nt_xent_criterion = TopologyAwareNTXentLoss(
+            device=torch.device(self.cur_device_name),
+            temperature=float(config["temperature"]),
+        ).double()
+        self.criterion = partial(sce_loss, alpha=float(config.get("alpha_l", 1.0)))
+
+    def on_save_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        checkpoint["rng"] = {
+            "torch_state": torch.get_rng_state(),
+            "cuda_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+            "numpy_state": np.random.get_state(),
+            "python_state": random.getstate(),
+        }
+
+    def on_load_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        rng = checkpoint.get("rng")
+        if not rng:
+            return
+        torch.set_rng_state(rng["torch_state"])
+        if torch.cuda.is_available() and rng.get("cuda_state") is not None:
+            torch.cuda.set_rng_state(rng["cuda_state"])
+        np.random.set_state(rng["numpy_state"])
+        random.setstate(rng["python_state"])
+
+    def _shared_step(self, batch: Tuple[Any, Any], stage: str) -> torch.Tensor:
         xis, xjs = batch
+        node_rep_i, z_i = self.encoder(xis)
+        node_rep_j, z_j = self.encoder(xjs)
+        masked_nodes_i = xis.masked_atom_indices
+        masked_nodes_j = xjs.masked_atom_indices
 
-        node_rep, zis = self.encoder(xis)
-        node_rep_j, zjs = self.encoder(xjs)
-
-        node_rep = node_rep.clone()
-        node_rep_j = node_rep_j.clone()
-
-        loss_rec_all = 0
-        masked_node_indices_i = xis.masked_atom_indices
-        masked_node_indices_j = xjs.masked_atom_indices
-
-        for i in range(self._num_remasking):
-            rep = node_rep.clone().detach().requires_grad_(True)
+        reconstruction_loss = 0.0
+        for _ in range(self.num_remasking):
+            rep_i = node_rep_i.clone().detach().requires_grad_(True)
             rep_j = node_rep_j.clone().detach().requires_grad_(True)
-
             with torch.no_grad():
-                rep_masked, remask_nodes, _ = random_remask(
-                    self.encoder.dec_mask_token, rep, xis,
-                    self.cur_device, self._remask_rate
-                )
-                rep_j_masked, remask_nodes_j, _ = random_remask(
-                    self.encoder.dec_mask_token, rep_j, xjs,
-                    self.cur_device, self._remask_rate
-                )
-
-            rep_masked = rep + (rep_masked - rep).detach()
+                rep_i_masked, _ = random_remask(self.encoder.dec_mask_token, rep_i, xis, self.device, self.remask_rate)
+                rep_j_masked, _ = random_remask(self.encoder.dec_mask_token, rep_j, xjs, self.device, self.remask_rate)
+            rep_i_masked = rep_i + (rep_i_masked - rep_i).detach()
             rep_j_masked = rep_j + (rep_j_masked - rep_j).detach()
 
-            # 互反交叉预测（核心改动）
-            recon = self.dec_pred_atoms(rep_masked,
-                                        xjs.edge_index,  # xis的表示预测xjs中被mask的原j
-                                        xjs.edge_attr,
-                                        masked_node_indices_j)
-            recon_j = self.dec_pred_atoms(rep_j_masked,
-                                          xis.edge_index,  # xjs的表示预测xis中被mask的原j
-                                          xis.edge_attr,
-                                          masked_node_indices_i)
+            recon_i = self.dec_pred_atoms(rep_i_masked, xis.edge_index, xis.edge_attr, masked_nodes_i)
+            recon_j = self.dec_pred_atoms(rep_j_masked, xjs.edge_index, xjs.edge_attr, masked_nodes_j)
+            reconstruction_loss = reconstruction_loss + self.criterion(
+                xis.node_attr_label[masked_nodes_i], recon_i[masked_nodes_i]
+            )
+            reconstruction_loss = reconstruction_loss + self.criterion(
+                xjs.node_attr_label[masked_nodes_j], recon_j[masked_nodes_j]
+            )
 
-            loss_rec_all += self.criterion(xjs.node_attr_label[masked_node_indices_j],
-                                           recon[masked_node_indices_j])
-            loss_rec_all += self.criterion(xis.node_attr_label[masked_node_indices_i],
-                                           recon_j[masked_node_indices_i])
-
-        # 非 remask 的 latent 交叉预测
-        pred_node = self.dec_pred_atoms(node_rep,
-                                        xjs.edge_index,
-                                        xjs.edge_attr,
-                                        masked_node_indices_j)
-        pred_node_j = self.dec_pred_atoms(node_rep_j,
-                                          xis.edge_index,
-                                          xis.edge_attr,
-                                          masked_node_indices_i)
-
-        if self.loss_fn == "sce":
-            latent_loss = self.criterion(xjs.node_attr_label, pred_node[masked_node_indices_j])
-            latent_loss += self.criterion(xis.node_attr_label, pred_node_j[masked_node_indices_i])
-        else:
-            latent_loss = self.criterion(pred_node.double()[masked_node_indices_i],
-                                         xis.mask_node_label[:, 0])
+        pred_i_to_j = self.dec_pred_atoms(node_rep_i, xjs.edge_index, xjs.edge_attr, masked_nodes_j)
+        pred_j_to_i = self.dec_pred_atoms(node_rep_j, xis.edge_index, xis.edge_attr, masked_nodes_i)
+        latent_loss = self.criterion(xjs.node_attr_label[masked_nodes_j], pred_i_to_j[masked_nodes_j])
+        latent_loss = latent_loss + self.criterion(xis.node_attr_label[masked_nodes_i], pred_j_to_i[masked_nodes_i])
 
         edge_loss = 0.0
-        if self.config['mask_edge']:
-            masked_edge_index_i = xis.edge_index[:, xis.connected_edge_indices]
-            masked_edge_index_j = xjs.edge_index[:, xjs.connected_edge_indices]
-
-            edge_rep = node_rep[masked_edge_index_j[0]] + node_rep[masked_edge_index_j[1]]
-            pred_edge = self.dec_pred_bonds(edge_rep,
-                                            xjs.edge_index,
-                                            xjs.edge_attr,
-                                            masked_node_indices_j)
-            edge_loss = self.criterion(pred_edge.double(), xjs.edge_attr_label)
-
-            edge_rep_j = node_rep_j[masked_edge_index_i[0]] + node_rep_j[masked_edge_index_i[1]]
-            pred_edge_j = self.dec_pred_bonds(edge_rep_j,
-                                              xis.edge_index,
-                                              xis.edge_attr,
-                                              masked_node_indices_i)
-            edge_loss += self.criterion(pred_edge_j.double(), xis.edge_attr_label)
-        zis = F.normalize(zis, dim=1)
-        zjs = F.normalize(zjs, dim=1)
-        if zis.shape[0] != self.nt_xent_criterion.batch_size:
-            self.nt_xent_criterion.batch_size = zis.shape[0]
-            self.nt_xent_criterion.mask_samples_from_same_repr = \
-                self.nt_xent_criterion._get_correlated_mask().type(torch.bool)
-
-        total_loss = latent_loss + loss_rec_all
-        # if hasattr(self, 'lambda_divergence') and self.lambda_divergence > 0.0:
-        #     div_loss = self.lambda_divergence * torch.norm(zis - zjs, p=2, dim=1).mean()
-        #     total_loss = total_loss + div_loss
-        return {'loss': total_loss}
-
-    # def training_step(self, batch, batch_idx):
-    #     xis, xjs = batch
-    #
-    #     node_rep, zis = self.encoder(xis)
-    #     node_rep_j, zjs = self.encoder(xjs)
-    #
-    #     node_rep = node_rep.clone()
-    #     node_rep_j = node_rep_j.clone()
-    #
-    #     loss_rec_all = 0
-    #     masked_node_indices_i = xis.masked_atom_indices
-    #     masked_node_indices_j = xjs.masked_atom_indices
-    #
-    #     for i in range(self._num_remasking):
-    #         rep = node_rep.clone().detach().requires_grad_(True)
-    #         rep_j = node_rep_j.clone().detach().requires_grad_(True)
-    #
-    #         with torch.no_grad():
-    #             rep_masked, remask_nodes, _ = random_remask(
-    #                 self.encoder.dec_mask_token, rep, xis,
-    #                 self.cur_device, self._remask_rate
-    #             )
-    #             rep_j_masked, remask_nodes_j, _ = random_remask(
-    #                 self.encoder.dec_mask_token, rep_j, xjs,
-    #                 self.cur_device, self._remask_rate
-    #             )
-    #
-    #         rep_masked = rep + (rep_masked - rep).detach()
-    #         rep_j_masked = rep_j + (rep_j_masked - rep_j).detach()
-    #
-    #         # ===== 改为自重建：A 预测 A，B 预测 B =====
-    #         recon = self.dec_pred_atoms(rep_masked,
-    #                                     xis.edge_index,  # 使用自己的边索引
-    #                                     xis.edge_attr,
-    #                                     masked_node_indices_i)  # 预测自己的掩码位置
-    #         recon_j = self.dec_pred_atoms(rep_j_masked,
-    #                                       xjs.edge_index,
-    #                                       xjs.edge_attr,
-    #                                       masked_node_indices_j)
-    #
-    #         loss_rec_all += self.criterion(xis.node_attr_label,
-    #                                        recon[masked_node_indices_i])
-    #         loss_rec_all += self.criterion(xjs.node_attr_label,
-    #                                        recon_j[masked_node_indices_j])
-    #
-    #     # 非 remask 的 latent 自重建
-    #     pred_node = self.dec_pred_atoms(node_rep,
-    #                                     xis.edge_index,  # 使用自己的边信息
-    #                                     xis.edge_attr,
-    #                                     masked_node_indices_i)  # 预测自己的掩码位置
-    #     pred_node_j = self.dec_pred_atoms(node_rep_j,
-    #                                       xjs.edge_index,
-    #                                       xjs.edge_attr,
-    #                                       masked_node_indices_j)
-    #
-    #     # 统一的自重建损失（修复 else 分支错误）
-    #     if self.loss_fn == "sce":
-    #         latent_loss = self.criterion(xis.node_attr_label, pred_node[masked_node_indices_i])
-    #         latent_loss += self.criterion(xjs.node_attr_label, pred_node_j[masked_node_indices_j])
-    #     else:
-    #         latent_loss = self.criterion(pred_node.double()[masked_node_indices_i],
-    #                                      xis.mask_node_label[:, 0])
-    #         latent_loss += self.criterion(pred_node_j.double()[masked_node_indices_j],
-    #                                       xjs.mask_node_label[:, 0])
-    #
-    #     edge_loss = 0.0
-    #     if self.config['mask_edge']:
-    #         masked_edge_index_i = xis.edge_index[:, xis.connected_edge_indices]
-    #         masked_edge_index_j = xjs.edge_index[:, xjs.connected_edge_indices]
-    #
-    #         # 边预测也改为自重建
-    #         edge_rep = node_rep[masked_edge_index_i[0]] + node_rep[masked_edge_index_i[1]]
-    #         pred_edge = self.dec_pred_bonds(edge_rep,
-    #                                         xis.edge_index,  # 自己的边结构
-    #                                         xis.edge_attr,
-    #                                         masked_node_indices_i)
-    #         edge_loss = self.criterion(pred_edge.double(), xis.edge_attr_label)
-    #
-    #         edge_rep_j = node_rep_j[masked_edge_index_j[0]] + node_rep_j[masked_edge_index_j[1]]
-    #         pred_edge_j = self.dec_pred_bonds(edge_rep_j,
-    #                                           xjs.edge_index,
-    #                                           xjs.edge_attr,
-    #                                           masked_node_indices_j)
-    #         edge_loss += self.criterion(pred_edge_j.double(), xjs.edge_attr_label)
-    #
-    #     zis = F.normalize(zis, dim=1)
-    #     zjs = F.normalize(zjs, dim=1)
-    #     if zis.shape[0] != self.nt_xent_criterion.batch_size:
-    #         self.nt_xent_criterion.batch_size = zis.shape[0]
-    #         self.nt_xent_criterion.mask_samples_from_same_repr = \
-    #             self.nt_xent_criterion._get_correlated_mask().type(torch.bool)
-    #
-    #     total_loss = (edge_loss + loss_rec_all
-    #                   + self.nt_xent_criterion(zis, zjs))
-    #     return {'loss': total_loss}
-    def training_step(self, batch, batch_idx):
-        xis, xjs = batch
-
-        node_rep, zis = self.encoder(xis)
-        node_rep_j, zjs = self.encoder(xjs)
-        node_rep = node_rep.clone()
-        node_rep_j = node_rep_j.clone()
-
-        loss_rec_all = 0
-        masked_node_indices_i = xis.masked_atom_indices  # 全局索引
-        masked_node_indices_j = xjs.masked_atom_indices
-        # ---------- 多次 remask 自重建 ----------
-        for i in range(self._num_remasking):
-            rep = node_rep.clone().detach().requires_grad_(True)
-            rep_j = node_rep_j.clone().detach().requires_grad_(True)
-
-            with torch.no_grad():
-                rep_masked, remask_nodes, _ = random_remask(
-                    self.encoder.dec_mask_token, rep, xis,
-                    self.cur_device, self._remask_rate
-                )
-                rep_j_masked, remask_nodes_j, _ = random_remask(
-                    self.encoder.dec_mask_token, rep_j, xjs,
-                    self.cur_device, self._remask_rate
-                )
-
-            rep_masked = rep + (rep_masked - rep).detach()
-            rep_j_masked = rep_j + (rep_j_masked - rep_j).detach()
-
-            # 自重建：A 的重掩码表示 → 预测 A 自身的掩码原子
-            recon = self.dec_pred_atoms(rep_masked,
-                                        xis.edge_index,  # 改为 A 的边
-                                        xis.edge_attr,  # 改为 A 的边属性
-                                        masked_node_indices_i)  # 改为 A 的掩码索引
-            # 自重建：B 的重掩码表示 → 预测 B 自身的掩码原子
-            recon_j = self.dec_pred_atoms(rep_j_masked,
-                                          xjs.edge_index,  # B 的边
-                                          xjs.edge_attr,  # B 的边属性
-                                          masked_node_indices_j)  # B 的掩码索引
-
-            # 损失对应自身标签
-            loss_rec_all += self.criterion(xis.node_attr_label[masked_node_indices_i],
-                                           recon[masked_node_indices_i])
-            loss_rec_all += self.criterion(xjs.node_attr_label[masked_node_indices_j],
-                                           recon_j[masked_node_indices_j])
-        # ---------- 非 remask 的交叉预测 ----------
-        pred_node = self.dec_pred_atoms(node_rep,
-                                        xjs.edge_index,
-                                        xjs.edge_attr,
-                                        masked_node_indices_j)
-        pred_node_j = self.dec_pred_atoms(node_rep_j,
-                                          xis.edge_index,
-                                          xis.edge_attr,
-                                          masked_node_indices_i)
-
-        # 统一为交叉损失（去掉错误的 else 分支）
-        latent_loss = self.criterion(xjs.node_attr_label[masked_node_indices_j],
-                                     pred_node[masked_node_indices_j])
-        latent_loss += self.criterion(xis.node_attr_label[masked_node_indices_i],
-                                      pred_node_j[masked_node_indices_i])
-
-        # ---------- 边预测（仅掩码边）----------
-        edge_loss = 0.0
-        if self.config['mask_edge']:
-            # 视图 A → B
+        if bool(self.config.get("mask_edge", True)):
             if xjs.connected_edge_indices.numel() > 0:
-                masked_edge_index_j = xjs.edge_index[:, xjs.connected_edge_indices]
-                edge_rep = node_rep[masked_edge_index_j[0]] + node_rep[masked_edge_index_j[1]]
-                pred_edge = self.dec_pred_bonds(edge_rep, xjs.edge_index, xjs.edge_attr, masked_node_indices_j)
-                edge_loss += self.criterion(pred_edge, xjs.edge_attr_label[xjs.connected_edge_indices])
-            # 视图 B → A
+                edge_index_j = xjs.edge_index[:, xjs.connected_edge_indices]
+                edge_rep_j = node_rep_i[edge_index_j[0]] + node_rep_i[edge_index_j[1]]
+                pred_edge_j = self.dec_pred_bonds(edge_rep_j, xjs.edge_index, xjs.edge_attr, masked_nodes_j)
+                edge_loss = edge_loss + self.criterion(pred_edge_j, xjs.edge_attr_label[xjs.connected_edge_indices])
             if xis.connected_edge_indices.numel() > 0:
-                masked_edge_index_i = xis.edge_index[:, xis.connected_edge_indices]
-                edge_rep_j = node_rep_j[masked_edge_index_i[0]] + node_rep_j[masked_edge_index_i[1]]
-                pred_edge_j = self.dec_pred_bonds(edge_rep_j, xis.edge_index, xis.edge_attr, masked_node_indices_i)
-                edge_loss += self.criterion(pred_edge_j, xis.edge_attr_label[xis.connected_edge_indices])
+                edge_index_i = xis.edge_index[:, xis.connected_edge_indices]
+                edge_rep_i = node_rep_j[edge_index_i[0]] + node_rep_j[edge_index_i[1]]
+                pred_edge_i = self.dec_pred_bonds(edge_rep_i, xis.edge_index, xis.edge_attr, masked_nodes_i)
+                edge_loss = edge_loss + self.criterion(pred_edge_i, xis.edge_attr_label[xis.connected_edge_indices])
 
+        z_i = F.normalize(z_i, dim=1)
+        z_j = F.normalize(z_j, dim=1)
+        if z_i.shape[0] != self.nt_xent_criterion.batch_size:
+            self.nt_xent_criterion.batch_size = z_i.shape[0]
+            self.nt_xent_criterion.mask_samples_from_same_repr = self.nt_xent_criterion._get_correlated_mask().type(torch.bool)
 
-        zis = F.normalize(zis, dim=1)
-        zjs = F.normalize(zjs, dim=1)
-        contrast_loss = self.nt_xent_criterion(zis, zjs)  # 若要保留则取消注释
-
-        # 总损失（这里将对比损失权重设为 0，符合理论）
-        total_loss =edge_loss +latent_loss+ loss_rec_all + contrast_loss
-        # total_loss += contrast_loss  # 如需保留可加回
-
-        return {'loss': total_loss}
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            module.weight.data.normal_(mean=0.0, std=0.02)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                module.bias.data.zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
-            module.weight.data.fill_(1.0)
-    def configure_optimizers(self):
-        model_params = []
-        dec_pred_atoms_params = []
-        dec_pred_bonds_params = []
-        # print(self.named_parameters())
-        for name, param in self.named_parameters():
-            if 'dec_pred_atoms' in name: 
-                dec_pred_atoms_params.append(param)
-            elif 'dec_pred_bonds' in name: 
-                dec_pred_bonds_params.append(param)
-            else: 
-                model_params.append(param)
-
-     
-        param_groups = [
-            {
-                'params': model_params,
-                'lr': self.config['init_lr'],  
-                'weight_decay': self.config['weight_decay']  
-            },
-            {
-                'params': dec_pred_atoms_params,
-                'lr': self.config['init_lr'],  
-                'weight_decay': self.config['weight_decay'] 
-            },
-            {
-                'params': dec_pred_bonds_params,
-                'lr': self.config['init_lr'],  
-                'weight_decay': self.config['weight_decay']
-            }
-        ]
-
-        optimizer = torch.optim.AdamW(
-            param_groups,
-            betas=(0.9, 0.99) 
+        contrast_loss = self.nt_xent_criterion(z_i, z_j)
+        divergence_loss = torch.norm(z_i - z_j, p=2, dim=1).mean()
+        total_loss = (
+            reconstruction_loss
+            + latent_loss
+            + edge_loss
+            + self.contrastive_weight * contrast_loss
+            + self.lambda_divergence * divergence_loss
         )
-        return optimizer
+        self.log(f"{stage}_loss", total_loss, prog_bar=True, sync_dist=True)
+        self.log(f"{stage}_contrast_loss", contrast_loss, sync_dist=True)
+        return total_loss
 
-    # def training_step(self, batch, batch_idx):
-    #     xis, xjs=batch
+    def training_step(self, batch: Tuple[Any, Any], batch_idx: int) -> torch.Tensor:
+        return self._shared_step(batch, "train")
 
-    #     node_rep,zis = self.encoder(xis)
-    #     #random remask
+    def validation_step(self, batch: Tuple[Any, Any], batch_idx: int) -> torch.Tensor:
+        return self._shared_step(batch, "val")
 
-    #     node_rep_j,zjs = self.encoder(xjs)
-        
-    #     node_rep = node_rep.clone() 
-    #     node_rep_j = node_rep_j.clone()
-    #     loss_rec_all = 0
-    #     masked_node_indices_i = xis.masked_atom_indices
-    #     masked_node_indices_j = xjs.masked_atom_indices
-
-    #     for i in range(self._num_remasking):
-    #         rep = node_rep.clone().detach().requires_grad_(True)
-    #         rep_j = node_rep_j.clone().detach().requires_grad_(True)
-    #         with torch.no_grad():
-    #             rep_masked, remask_nodes, _ = random_remask(
-    #                 self.encoder.dec_mask_token,
-    #                 rep,
-    #                 xis,
-    #                self.cur_device,
-    #                 self._remask_rate
-    #             )
-                
-    #             rep_j_masked, remask_nodes_j, _ = random_remask(
-    #                 self.encoder.dec_mask_token,
-    #                 rep_j,
-    #                 xjs,
-    #                self.cur_device,
-    #                 self._remask_rate
-    #             )
-    #         rep_masked = rep + (rep_masked - rep).detach()
-    #         rep_j_masked = rep_j + (rep_j_masked - rep_j).detach()
-
-    #         recon = self.dec_pred_atoms(rep_masked, xis.edge_index, xis.edge_attr, masked_node_indices_i)
-    #         recon_j = self.dec_pred_atoms(rep_j_masked, xjs.edge_index, xjs.edge_attr, masked_node_indices_j)
-    #         x_init = xis.node_attr_label[masked_node_indices_i]
-    #         x_rec = recon[masked_node_indices_i]
-    #         loss_rec_all = loss_rec_all + self.criterion(x_init, x_rec)
-    #         x_init = xis.node_attr_label[masked_node_indices_j]
-    #         x_rec = recon_j[masked_node_indices_j]
-    #         loss_rec_all = loss_rec_all + self.criterion(x_init, x_rec)
-
-    #     node_attr_label = xis.node_attr_label
-    #     masked_node_indices = xis.masked_atom_indices
-    #     pred_node =  self.dec_pred_atoms(node_rep, xis.edge_index, xis.edge_attr, masked_node_indices)
-
-
-    #     node_attr_label_j = xjs.node_attr_label
-    #     masked_node_indices_j = xjs.masked_atom_indices
-    #     pred_node_j =  self.dec_pred_atoms(node_rep_j, xjs.edge_index, xjs.edge_attr, masked_node_indices_j)
-    #     # loss = criterion(pred_node.double(), batch.mask_node_label[:,0])
-    #     if self.loss_fn == "sce":
-    #         latent_loss = self.criterion(node_attr_label, pred_node[masked_node_indices])
-    #         latent_loss = latent_loss + self.criterion(node_attr_label_j, pred_node_j[masked_node_indices_j])
-    #     else:
-    #         latent_loss = self.criterion(pred_node.double()[masked_node_indices], xis.mask_node_label[:, 0])
-
-    #     if self.config['mask_edge']:
-    #         masked_edge_index = xis.edge_index[:, xis.connected_edge_indices]
-    #         edge_rep = node_rep[masked_edge_index[0]] + node_rep[masked_edge_index[1]]
-    #         pred_edge = self.dec_pred_bonds(edge_rep, xis.edge_index, xis.edge_attr, masked_node_indices)
-    #         edge_loss =  self.criterion(pred_edge.double(), xis.edge_attr_label)
-
-    #         masked_edge_index_j = xjs.edge_index[:, xjs.connected_edge_indices]
-    #         edge_rep_j = node_rep[masked_edge_index_j[0]] + node_rep[masked_edge_index_j[1]]
-    #         pred_edge_j = self.dec_pred_bonds(edge_rep_j, xjs.edge_index, xjs.edge_attr, masked_node_indices_j)
-    #         edge_loss = edge_loss + self.criterion(pred_edge_j.double(), xjs.edge_attr_label)
-    #         # acc_edge = compute_accuracy(pred_edge, batch.mask_edge_label[:,0])
-    #         # acc_edge_accum += acc_edge
-
-
-    #     zis = F.normalize(zis, dim=1)
-    #     zjs = F.normalize(zjs, dim=1)
-    #     if(zis.shape[0]!=self.nt_xent_criterion.batch_size):
-    #         self.nt_xent_criterion.batch_size=zis.shape[0]
-    #         self.nt_xent_criterion.mask_samples_from_same_repr = self.nt_xent_criterion._get_correlated_mask().type(torch.bool)
-    #     total_loss = edge_loss + latent_loss + loss_rec_all + self.nt_xent_criterion(zis, zjs)
-    #     return {'loss':total_loss}
-
-from pytorch_lightning.callbacks import ModelCheckpoint
-import torch
-torch.serialization.add_safe_globals([ModelCheckpoint])
-
-def load_smiles_from_files(filepaths):
-    smiles_list = []
-    for filepath in filepaths:
-        with open(filepath, 'r') as file:
-            for line in file:
-                smiles = line.strip().split()[0] 
-                if smiles=='smiles':
-                    continue
-                smiles_list.append(smiles)
-    return smiles_list
-# def get_nccl_socket_ifname():
-#     ipa = subprocess.run(['ip', 'a'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-#     lines = ipa.stdout.decode('utf-8').split('\n')
-#     all_names = []
-#     name = None
-#     for line in lines:
-#         if line and not line[0] == ' ':
-#             name = line.split(':')[1].strip()
-#             continue
-#         if 'link/infiniband' in line:
-#             all_names.append(name)
-#     os.environ['NCCL_SOCKET_IFNAME'] = 'en,eth,em,bond'
-# # ','.join(all_names)
-# def fix_infiniband():
-#     # os.environ['NCCL_SOCKET_IFNAME'] = "^lo,docker,virbr,vmnet,vboxnet,wl,ww,ppp,bond"
-
-#     # ifname = os.environ.get('NCCL_SOCKET_IFNAME', None)
-#     # if ifname is None:
-#     #     os.environ['NCCL_SOCKET_IFNAME'] = '^lo,docker0'
-
-#     get_nccl_socket_ifname()
-#     os.environ['NCCL_IB_CUDA_SUPPORT'] = '1'
-#     ibv = subprocess.run('ibv_devinfo', stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-#     lines = ibv.stdout.decode('utf-8').split('\n')
-#     exclude = ''
-#     for line in lines:
-#         if 'hca_id:' in line:
-#             name = line.split(':')[1].strip()
-#         if '\tport:' in line:
-#             port = line.split(':')[1].strip()
-#         if 'link_layer:' in line and 'Ethernet' in line:
-#             exclude = exclude + f'{name}:{port},'
-#     if exclude:
-#         exclude = '^' + exclude[:-1]
-#         # print(exclude)
-#         os.environ['NCCL_IB_HCA'] = exclude
-def get_nccl_socket_ifname():
-    return ""  # 直接返回空，不执行Linux命令
-
-def fix_infiniband():
-    pass  # 什么都不做
-def main():
-    for var in ["MASTER_ADDR", "MASTER_PORT", "NODE_RANK", "LOCAL_RANK"]:
-        os.environ.pop(var, None)
-    fix_infiniband()
-    config={
-        'batch_size': 128,  # batch size
-        'warm_up': 1,  # warm-up epochs
-        'epochs': 1, # total number of epochs
-'num_nodes':1,
-        'load_model': None,  # resume training
-        'eval_every_n_epochs': 1,  # validation frequency
-        'save_every_n_epochs': 1 , # automatic model saving frequecy
-        'log_every_n_steps': 1,  # print training log frequency
-
-        'fp16_precision': False,  # float precision 16 (i.e. True/False)
-        'init_lr': 3e-4*1 ,  # initial learning rate for Adam
-        'weight_decay': 1e-5,  # weight decay for Adam
-'world_size':1,
-    'model_type': 'gin' , # GNN backbone (i.e., gin/gcn)
-
-    'num_layer': 6,  # number of graph conv layers
-    'emb_dim': 1024,  # embedding dimension in graph conv layers
-    'feat_dim': 768,  # output feature dimention
-    'drop_ratio': 0,  # dropout ratio
-    'pool': 'mean',  # readout pooling (i.e., mean/max/add)
-
-    'aug': 'node',  # molecule graph augmentation strategy (i.e., node/subgraph/mix)
-
-    'num_workers':0,  # dataloader number of workers
-    'valid_size': 0.05,  # ratio of validation data
-    
-    'temperature': 0.1,  # temperature of NT-Xent loss
-    'use_cosine_similarity': True,  # whet
-        'JK': 'last',
-    'dropout_ratio': 0.0,
-    'gnn_type': 'gin',
-    'mask_rate':0.15,
-    'mask_edge':True,
-        'input_model_file':'',
-        'use_scheduler':True,
-        'alpha_l':1.0,
-        'output_model_file':'gin_pretrain_remask_20250529_ZINC_dist',
-        'loss_fn':'sce',
-        'restart_path':'',
-        'max_len':202,
-        'lambda_divergence': 0.0,  # 默认值，扫描时外部覆写
-    }
-    import scanpy as sc
-    import getpass
-    if config['num_nodes'] > 1:
-        # print("Using " + str(config.num_nodes) + " Nodes----------------------------------------------------------------------")
-        LSB_MCPU_HOSTS = os.environ["LSB_MCPU_HOSTS"].split(' ') # Parses Node list set by LSF, in format hostname proceeded by number of cores requested
-        HOST_LIST = LSB_MCPU_HOSTS[::2] # Strips the cores per node items in the list
-        os.environ["MASTER_ADDR"] = HOST_LIST[0] # Sets the MasterNode to thefirst node on the list of hosts
-        os.environ["MASTER_PORT"] = "54966"
-        os.environ["NODE_RANK"] = str(HOST_LIST.index(os.environ["HOSTNAME"])) #Uses the list index for node rank, master node rank must be 0
-        #os.environ["NCCL_SOCKET_IFNAME"] = 'ib,bond'  # avoids using docker of loopback interface
-        os.environ["NCCL_DEBUG"] = "INFO" #sets NCCL debug to info, during distributed training, bugs in code show up as nccl errors
-        #os.environ["NCCL_IB_CUDA_SUPPORT"] = '1' #Force use of infiniband
-        #os.environ["NCCL_TOPO_DUMP_FILE"] = 'NCCL_TOP.%h.xml'
-        #os.environ["NCCL_DEBUG_FILE"] = 'NCCL_DEBUG.%h.%p.txt'
-        print(os.environ["HOSTNAME"] + " MASTER_ADDR: " + os.environ["MASTER_ADDR"])
-        print(os.environ["HOSTNAME"] + " MASTER_PORT: " + os.environ["MASTER_PORT"])
-        print(os.environ["HOSTNAME"] + " NODE_RANK " + os.environ["NODE_RANK"])
-        print(os.environ["HOSTNAME"] + " NCCL_SOCKET_IFNAME: " + os.environ["NCCL_SOCKET_IFNAME"])
-        print(os.environ["HOSTNAME"] + " NCCL_DEBUG: " + os.environ["NCCL_DEBUG"])
-        print(os.environ["HOSTNAME"] + " NCCL_IB_CUDA_SUPPORT: " + os.environ["NCCL_IB_CUDA_SUPPORT"])
-        print("Using " + str(config['num_nodes']) + " Nodes---------------------------------------------------------------------")
-        print("Using " + str(torch.cuda.device_count()) + " GPUs---------------------------------------------------------------------")
-    else:
-        print("Using " + str(config['num_nodes']) + " Node----------------------------------------------------------------------")
-        print("Using " + str(torch.cuda.device_count()) + " GPUs---------------------------------------------------------------------")
-    train_config = {'batch_size':config['batch_size'], 'num_workers':config['num_workers'], 'pin_memory':True}
-    torch.serialization.add_safe_globals([np.core.multiarray._reconstruct])
-    # 需要扫描的 λ 值列表
-    lambda_values = [0]
-
-    # 存储每个 λ 的结果
-    results = []
-
-    # 基础配置（不包含 lambda_divergence，每个循环动态加入）
-    base_config = config.copy()  # 使用您已有的 dict
-
-    for lam in lambda_values:
-        print(f"\n{'='*40}\nTraining with λ = {lam}\n{'='*40}")
-        current_config = base_config.copy()
-        current_config['lambda_divergence'] = lam
-
-        # 重新创建数据模块（避免缓存冲突）
-        data_loader = MoleculeModule(current_config['max_len'], None, train_config)
-        data_loader.setup()
-        cachefiles = data_loader.get_cache()
-        checkpoint_callback = pl.callbacks.ModelCheckpoint(
-            # Save checkpoint every 1 epoch
-            save_top_k=-1,
-            # Save all checkpoints (you can change this to a positive integer to save top-k checkpoints based on a monitored metric)
-            verbose=True  # Print information about checkpoint saving
+    def configure_optimizers(self) -> torch.optim.Optimizer:
+        return torch.optim.AdamW(
+            self.parameters(),
+            lr=float(self.config["init_lr"]),
+            weight_decay=float(self.config["weight_decay"]),
+            betas=(0.9, 0.99),
         )
-        try:
-            # molgatmae = MolGATMAE(current_config)
-            checkpoint_path = 'E:\生信\scMCP\DrugGCL\\version_160\checkpoints\epoch=0-step=4688.ckpt'
 
-            # 手动加载完整 checkpoint 字典（包含模型参数和所有状态）
-            # checkpoint = torch.load(checkpoint_path, weights_only=False, map_location='cuda')
 
-            # 提取模型参数
-            # model_state = checkpoint.get('state_dict', checkpoint)  # 兼容不同保存方式
+def run_qm9_probe_if_requested(model: MolGATMAE, config: Dict[str, Any]) -> Optional[float]:
+    """Optionally run a QM9 ridge probe after pre-training."""
+    probe = config.get("qm9_probe")
+    if not probe:
+        return None
 
-            # 实例化模型并加载参数
-            molgatmae = MolGATMAE(current_config)
-            # molgatmae.load_state_dict(model_state, strict=True)
-            molgatmae.to('cuda')
-            # molgatmae.load_state_dict(model_state)
-            # molgatmae = MolGATMAE.load_from_checkpoint('E:\生信\scMCP\DrugGCL\\version_160\checkpoints\epoch=0-step=4688.ckpt', config=current_config)
-            #
-        except RuntimeError as e:
-            if "inline_container.cc" in str(e):
-                print(f"Skipping λ={lam} due to corrupted checkpoint: {e}")
-                continue
-            else:
-                raise
-        # Trainer（为每个 λ 创建独立日志目录）
-        trainer = pl.Trainer(
-            default_root_dir=f'./lambda_{lam:.4f}/',
-            max_epochs=current_config['epochs'],
-            precision=16,
-            gpus=1,
-            num_nodes=1,
-            callbacks=[checkpoint_callback, ModelCheckpointAtEpochEnd(), CheckpointEveryNSteps(1000)],
-            accumulate_grad_batches=1,
-            num_sanity_val_steps=10,
-            val_check_interval=30,
-        )
-        try:
-            train_loader = data_loader.train_dataloader()
-            print(f"Training batches: {len(train_loader)}")
-            trainer.fit(model=molgatmae, train_dataloader=train_loader)
-        except Exception as exp:
-            print(f"Training failed for λ={lam}: {exp}")
-            rank_zero_warn('Error caught, cleaning up')
-            remove_tree(cachefiles)
-            continue  # 跳过当前 λ，继续下一个
+    train_csv = probe.get("train_csv")
+    test_csv = probe.get("test_csv")
+    if not train_csv or not test_csv:
+        raise ValueError("qm9_probe requires train_csv and test_csv.")
 
-        # ---------- 训练完成后计算表示差异 D 和验证损失 ----------
-        molgatmae.eval()
-        molgatmae.to('cuda')
-        val_loader = data_loader.val_dataloader()
-        # 1. 计算表示差异 D（取训练集前30个batch）
-        all_D = []
-        with torch.no_grad():
-            # train_loader_for_D = train_loader.train_dataloader()
-            for i, batch in enumerate(val_loader):
-                if i >= 30:
-                    break
-                xis, xjs = batch
-                xis, xjs = xis.to('cuda'), xjs.to('cuda')
-                _, zis = molgatmae.encoder(xis)  # 假设 encoder 返回 (_, z)
-                _, zjs = molgatmae.encoder(xjs)
-                D_batch = torch.norm(zis - zjs, p=2, dim=1).mean()
-                all_D.append(D_batch.item())
-        mean_D = sum(all_D) / len(all_D) if all_D else float('nan')
+    smiles_train, y_train_raw = load_qm9_data(train_csv)
+    smiles_test, y_test_raw = load_qm9_data(test_csv)
+    scaler = StandardScaler()
+    y_train = scaler.fit_transform(y_train_raw)
+    y_test = scaler.transform(y_test_raw)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    return evaluate_linear_probe(model.encoder, smiles_train, y_train, smiles_test, y_test, device=device)
 
-        total_val_loss = 0.0
-        num_val_batches = 0
-        # with torch.no_grad():
-        #     for i, batch in enumerate(val_loader):
-        #         xis, xjs = batch
-        #         xis, xjs = xis.to('cuda'), xjs.to('cuda')
-        #         # 方式一：直接调用模型的 contrastive_loss（如果实现了）
-        #         if hasattr(molgatmae, 'contrastive_loss'):
-        #             zis, _ = molgatmae.encoder(xis)
-        #             zjs, _ = molgatmae.encoder(xjs)
-        #             loss = molgatmae.contrastive_loss(zis, zjs)
-        #         # 方式二：调用 training_step（注意需要 batch_idx，且可能依赖 Trainer 状态）
-        #         else:
-        #             # 假设 training_step 不依赖 self.trainer 的属性
-        #             loss = molgatmae.validation_step(batch, i)  # i 作为 batch_idx
-        #         total_val_loss += loss['loss'].item()
-        #         num_val_batches += 1
-        # val_loss = total_val_loss / num_val_batches if num_val_batches > 0 else float('nan')
 
-        test_mae = evaluate_linear_probe(
-            molgatmae.encoder,
-            smiles_train, y_train,
-            smiles_test, y_test,
-            device='cuda'
-        )
-        # 存储结果
-        results.append({'lambda': lam, 'mean_D': mean_D,  'test_mae': test_mae})
-        print(f"λ={lam:.4f}, mean D={mean_D:.4f},  test_MAE={test_mae:.4f}")
+def build_trainer(config: Dict[str, Any]) -> pl.Trainer:
+    """Create a Lightning trainer from config."""
+    output_dir = Path(config["output_dir"])
+    callbacks = [
+        ModelCheckpoint(dirpath=str(output_dir / "checkpoints"), save_top_k=int(config["save_top_k"]), every_n_epochs=1),
+        LearningRateMonitor(logging_interval="step"),
+    ]
+    if int(config.get("save_every_n_steps", 0)) > 0:
+        callbacks.append(CheckpointEveryNSteps(save_step_frequency=int(config["save_every_n_steps"])))
 
-        # 清理缓存（只执行一次）
-        remove_tree(cachefiles)
+    return pl.Trainer(
+        default_root_dir=str(output_dir),
+        max_epochs=int(config["epochs"]),
+        accelerator=config.get("accelerator", "auto"),
+        devices=config.get("devices", "auto"),
+        precision=config.get("precision", "32-true"),
+        callbacks=callbacks,
+        accumulate_grad_batches=int(config.get("accumulate_grad_batches", 1)),
+        log_every_n_steps=int(config.get("log_every_n_steps", 10)),
+        val_check_interval=config.get("val_check_interval", 1.0),
+        num_sanity_val_steps=int(config.get("num_sanity_val_steps", 0)),
+    )
 
-        # 可选：强制清理 GPU 缓存和 DataLoader 残留
-        del train_loader, val_loader
-        torch.cuda.empty_cache()
-        import gc;
-        gc.collect()
 
-    # 打印结果表格
-    print("\n===== Scan Results =====")
-    for r in results:
-        print(f"λ={r['lambda']:.4f}, D={r['mean_D']:.4f}")
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Pre-train RMMol on SMILES files.")
+    parser.add_argument("--config", type=str, default=None, help="Path to a YAML config file.")
+    parser.add_argument("--data_path", type=str, default=None, help="SMILES file, directory, or comma-separated file list.")
+    parser.add_argument("--output_dir", type=str, default=None, help="Output directory for logs and checkpoints.")
+    parser.add_argument("--epochs", type=int, default=None, help="Number of training epochs.")
+    parser.add_argument("--batch_size", type=int, default=None, help="Training batch size.")
+    parser.add_argument("--devices", type=str, default=None, help="Lightning devices argument, for example 1 or auto.")
+    return parser.parse_args()
 
-    # 可选：绘制 D - λ 曲线
-    import matplotlib.pyplot as plt
-    lambs = [r['lambda'] for r in results]
-    Ds = [r['mean_D'] for r in results]
-    plt.figure()
-    plt.plot(lambs, Ds, 'o-')
-    plt.xscale('log')
-    plt.xlabel('λ')
-    plt.ylabel('Mean representation divergence D')
-    plt.title('Effect of λ on inter-view divergence')
-    plt.grid(True)
-    plt.savefig('lambda_D_curve.png', dpi=300)
-    plt.show()
+
+def main() -> None:
+    args = parse_args()
+    config = load_config(args.config)
+    for key in ["data_path", "output_dir", "epochs", "batch_size", "devices"]:
+        value = getattr(args, key)
+        if value is not None:
+            config[key] = value
+
+    if not config.get("data_path"):
+        raise ValueError("Set data_path in YAML or pass --data_path.")
+
+    pl.seed_everything(int(config["seed"]), workers=True)
+    data_module = MoleculeModule(config["data_path"], config)
+    model = MolGATMAE(config)
+
+    checkpoint_path = config.get("resume_from_checkpoint")
+    trainer = build_trainer(config)
+    trainer.fit(model=model, datamodule=data_module, ckpt_path=checkpoint_path)
+
+    qm9_mae = run_qm9_probe_if_requested(model, config)
+    if qm9_mae is not None:
+        print(f"QM9 probe mean MAE: {qm9_mae:.6f}")
+
+    if config.get("cleanup_cache", False):
+        remove_tree(data_module.cache_files)
+
 
 if __name__ == "__main__":
     main()

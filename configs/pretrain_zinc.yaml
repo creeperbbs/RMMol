@@ -1,0 +1,37 @@
+seed: 2025
+data_path: data/smiles
+output_dir: runs/rmmol_pretrain
+
+batch_size: 128
+epochs: 100
+num_workers: 4
+pin_memory: true
+valid_size: 0.05
+
+num_layer: 6
+emb_dim: 1024
+feat_dim: 768
+dropout_ratio: 0.0
+gnn_type: gin
+JK: last
+
+mask_rate: 0.25
+mask_edge: true
+mask_edge_rate: 0.25
+num_remasking: 2
+remask_rate: 0.5
+
+init_lr: 0.0003
+weight_decay: 0.00001
+temperature: 0.1
+use_cosine_similarity: true
+alpha_l: 1.0
+contrastive_weight: 1.0
+lambda_divergence: 0.0
+
+accelerator: auto
+devices: auto
+precision: 32-true
+save_top_k: -1
+log_every_n_steps: 10
+num_sanity_val_steps: 0

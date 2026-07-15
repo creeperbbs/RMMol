@@ -1,20 +1,13 @@
 import math
 import random
 from copy import deepcopy
-from torch.utils.data.distributed import DistributedSampler
 import networkx as nx
 import numpy as np
 import pandas as pd
 import torch
 from torch_geometric.data import Data, Batch
-from torch.utils.data import Dataset
-from torch.utils.data.sampler import SubsetRandomSampler
-import rdkit
 from rdkit import Chem
-from torch_geometric.data import Data, Dataset, DataLoader
-from rdkit.Chem.rdchem import HybridizationType
 from rdkit.Chem.rdchem import BondType as BT
-from rdkit.Chem import AllChem
 import torch.nn.functional as F
 # allowable node and edge features
 FEATURES_LIST = {
@@ -94,13 +87,10 @@ def remove_subgraph(Graph, center, percent=0.2):
 
 
 def read_smiles(data_path):
-    smiles_data = []
-    with open(data_path) as csv_file:
-        csv_reader = pd.read_csv(csv_file)
-        for i, row in enumerate(csv_reader):
-            smiles = row[-1]
-            smiles_data.append(smiles)
-    return smiles_data
+    df = pd.read_csv(data_path)
+    if "smiles" in df.columns:
+        return df["smiles"].astype(str).tolist()
+    return df.iloc[:, -1].astype(str).tolist()
 
 def bool_to_int(value):
     return 1 if value else 0
@@ -121,6 +111,8 @@ class MoleculeProcessor():
 
         for smiles in batch:
             di, dj = self.process_single(smiles['text'])  # Single-graph data of two views
+            if di is None or dj is None:
+                continue
 
             # ===== manually offset the node and edge index of view A =====
             if di.masked_atom_indices.numel() > 0:
@@ -141,6 +133,9 @@ class MoleculeProcessor():
             data_i_list.append(di)
             data_j_list.append(dj)
 
+        if not data_i_list:
+            raise ValueError("No valid molecules were found in this batch.")
+
         #At this point, the index of each Data has become a global index, and Batch.from_data_list will no longer offset them
 
 
@@ -150,6 +145,8 @@ class MoleculeProcessor():
 
     def process_single(self, smiles):
         mol = Chem.MolFromSmiles(smiles)
+        if mol is None or mol.GetNumAtoms() == 0:
+            return None, None
         # mol = Chem.AddHs(mol)
 
         N = mol.GetNumAtoms()
@@ -196,9 +193,13 @@ class MoleculeProcessor():
         for bond in bonds:
             edges.append([bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()])
         molGraph = nx.Graph(edges)
+        molGraph.add_nodes_from(range(N))
 
         # Get the graph for i and j after removing subgraphs
-        start_i, start_j = random.sample(list(range(N)), 2)
+        if N >= 2:
+            start_i, start_j = random.sample(list(range(N)), 2)
+        else:
+            start_i = start_j = 0
         percent_i, percent_j = random.uniform(0, 0.2), random.uniform(0, 0.2)
         G_i, removed_i = remove_subgraph(molGraph, start_i, percent=percent_i)
         G_j, removed_j = remove_subgraph(molGraph, start_j, percent=percent_j)
@@ -229,9 +230,9 @@ class MoleculeProcessor():
                 edge_feat_j.append(feature)
 
         edge_index_i = torch.tensor([row_i, col_i], dtype=torch.long)
-        edge_attr_i = torch.tensor(np.array(edge_feat_i), dtype=torch.long)
+        edge_attr_i = torch.tensor(edge_feat_i, dtype=torch.long).view(-1, 4)
         edge_index_j = torch.tensor([row_j, col_j], dtype=torch.long)
-        edge_attr_j = torch.tensor(np.array(edge_feat_j), dtype=torch.long)
+        edge_attr_j = torch.tensor(edge_feat_j, dtype=torch.long).view(-1, 4)
 
         ############################
         # Random Atom/Edge Masking #
@@ -240,10 +241,12 @@ class MoleculeProcessor():
         atom_remain_indices_i = [i for i in range(N) if i not in removed_i]
         atom_remain_indices_j = [i for i in range(N) if i not in removed_j]
 
-        num_mask_nodes_i = max([1, math.floor(0.25 * N) - len(removed_i)])
-        num_mask_nodes_j = max([1, math.floor(0.25 * N) - len(removed_j)])
-        mask_nodes_i = random.sample(atom_remain_indices_i, num_mask_nodes_i)
-        mask_nodes_j = random.sample(atom_remain_indices_j, num_mask_nodes_j)
+        num_mask_nodes_i = max(1, math.floor(self.mask_rate * N) - len(removed_i))
+        num_mask_nodes_j = max(1, math.floor(self.mask_rate * N) - len(removed_j))
+        num_mask_nodes_i = min(num_mask_nodes_i, len(atom_remain_indices_i))
+        num_mask_nodes_j = min(num_mask_nodes_j, len(atom_remain_indices_j))
+        mask_nodes_i = random.sample(atom_remain_indices_i, num_mask_nodes_i) if num_mask_nodes_i else []
+        mask_nodes_j = random.sample(atom_remain_indices_j, num_mask_nodes_j) if num_mask_nodes_j else []
         # ---------- view A: Construct the full graph node label ----------
         # Total Dimension of Node Features # len(FEATURES_LIST['CHIRALITY_LIST']) + \
         node_feat_dim = (len(ATOM_LIST) + 1) + \
@@ -371,13 +374,13 @@ class MoleculeProcessor():
 
 
 def molcae_embed(model, smiles_list, device='cpu'):
+    model.to(device)
     model.eval()
-    embeddings = []
-    Cs = []
     data_list = []
     for i in smiles_list:
-        # print(i)
         mol = Chem.MolFromSmiles(i)
+        if mol is None or mol.GetNumAtoms() == 0:
+            raise ValueError(f"Invalid SMILES: {i}")
         N = mol.GetNumAtoms()
         M = mol.GetNumBonds()
         atoms = mol.GetAtoms()
@@ -428,7 +431,7 @@ def molcae_embed(model, smiles_list, device='cpu'):
             ])
 
         edge_index = torch.tensor([row, col], dtype=torch.long)
-        edge_attr = torch.tensor(np.array(edge_feat), dtype=torch.long)
+        edge_attr = torch.tensor(edge_feat, dtype=torch.long).view(-1, 4)
 
         data_list.append(Data(x=x, edge_index=edge_index, edge_attr=edge_attr))
     batch_data = Batch.from_data_list(data_list)

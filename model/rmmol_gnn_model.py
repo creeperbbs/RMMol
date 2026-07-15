@@ -6,12 +6,7 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from torch_geometric.utils import to_dense_batch
-import numpy as np
-from rdkit import Chem
-from rdkit.Chem import AllChem
 from torch_geometric.nn import MessagePassing
-from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool
 num_atom_type = 119  
 num_chirality_tag = 4
 num_degree = 11
@@ -21,7 +16,7 @@ num_implicit_valence = 7
 num_hybridization_tag = 7
 num_bond_type = 6
 num_bond_direction = 3
-from torch_geometric.utils import degree, add_self_loops
+from torch_geometric.utils import add_self_loops
 
 class GraphDegreeConv(nn.Module):
     def __init__(self, node_size, edge_size, output_size, degree_list, device, batch_normalize=True):
@@ -192,12 +187,14 @@ class GNN(nn.Module):
 
     def forward(self, *argv):
         if len(argv) == 3:
+            data = None
             x, edge_index, edge_attr = argv[0], argv[1], argv[2]
         elif len(argv) == 1:
             data = argv[0]
             x, edge_index, edge_attr = data.x, data.edge_index, data.edge_attr
         else:
             raise ValueError("unmatched number of arguments.")
+        device = x.device
         deg = torch.bincount(edge_index.view(-1), minlength=x.size(0)).long()
         deg = deg // 2
         # x[:, 3] = deg.float()
@@ -210,15 +207,20 @@ class GNN(nn.Module):
         sorted_deg, sorted_nodes = torch.sort(deg, descending=False)
         x_reconstructed = x[sorted_nodes].clone()
         to_map = sorted_nodes
-        inv_perm = torch.zeros_like(to_map).cuda()
-        inv_perm[to_map] = torch.arange(num_nodes, device=self.device)
+        inv_perm = torch.zeros_like(to_map, device=device)
+        inv_perm[to_map] = torch.arange(num_nodes, device=device)
         edge_index = inv_perm[edge_index]
         row, col = edge_index
         deg = deg[to_map]
         unique_deg, counts = torch.unique(deg, return_counts=True)
         neighbor_by_degree = []
-        batch_idx = [[] for i in range(data.batch[-1]+1)]
-        graph = data.batch[to_map]
+        if data is not None and hasattr(data, 'batch'):
+            graph = data.batch[to_map]
+            num_graphs = int(data.batch.max().item()) + 1
+        else:
+            graph = torch.zeros(num_nodes, dtype=torch.long, device=device)
+            num_graphs = 1
+        batch_idx = [[] for i in range(num_graphs)]
         begin_index = 0
         index = 0
         
@@ -230,7 +232,7 @@ class GNN(nn.Module):
             if d in unique_deg:
                 node_indices = counts[index]
                 for node in range(begin_index,begin_index+node_indices):
-                    batch_idx[graph[node]].append(node)
+                    batch_idx[int(graph[node].item())].append(node)
                     edge_mask = (row == node)
                     edge_ids = torch.where(edge_mask)[0].tolist()
                     
@@ -253,26 +255,26 @@ class GNN(nn.Module):
         # h_list = [x_reconstructed]
         
         # max_num_nodes = max([data.ptr.tolist()[i] - data.ptr.tolist()[i-1] for i in range(len(data.ptr.tolist())) if i > 0])
-        if hasattr(data, 'ptr'):
+        if data is not None and hasattr(data, 'ptr'):
             max_num_nodes = max([data.ptr.tolist()[i] - data.ptr.tolist()[i-1] for i in range(len(data.ptr.tolist())) if i > 0])
         else:
-            max_num_nodes = max([data.x.size(0)])
-        if hasattr(data, 'num_graphs'):
-            fingerprint_atom = torch.zeros(data.num_graphs,max_num_nodes, self.emb_dim).to(self.device).float()
+            max_num_nodes = x.size(0)
+        if data is not None and hasattr(data, 'num_graphs'):
+            fingerprint_atom = torch.zeros(data.num_graphs,max_num_nodes, self.emb_dim, device=device).float()
         else:
-            fingerprint_atom = torch.zeros(1,max_num_nodes, self.emb_dim).to(self.device).float()
+            fingerprint_atom = torch.zeros(1,max_num_nodes, self.emb_dim, device=device).float()
         # fingerprint_atom = torch.zeros(data.num_graphs,max_num_nodes, self.emb_dim).to(self.device).float()
-        atom_activations = torch.zeros( x_reconstructed.size(0), self.emb_dim).to(self.device).float()
+        atom_activations = torch.zeros( x_reconstructed.size(0), self.emb_dim, device=device).float()
         
         for layer_idx in range(self.num_layer):
             # (#nodes, #output_size)
             
-            atom_activations += fingerprint_update(self.out_layers[layer_idx].float(), x_reconstructed.float()).to(self.device)
+            atom_activations += fingerprint_update(self.out_layers[layer_idx].float(), x_reconstructed.float()).to(device)
             
             
-            x_reconstructed = self.gnns[layer_idx](x_reconstructed.float().to(self.device), edge_emb.to(self.device),
+            x_reconstructed = self.gnns[layer_idx](x_reconstructed.float().to(device), edge_emb.to(device),
                                                     neighbor_by_degree)
-        atom_activations += fingerprint_update(self.out_layers[-1],  x_reconstructed).to(self.device)
+        atom_activations += fingerprint_update(self.out_layers[-1],  x_reconstructed).to(device)
 
         for idx, atom_idx in enumerate(batch_idx):
             fingerprint_atom[idx][:len(atom_idx)] = atom_activations[atom_idx, ...]
