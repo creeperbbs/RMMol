@@ -1,4 +1,4 @@
-<<<<<<< HEAD
+
 # RMMol
 
 Implicit conformational perception via geometry-aware reciprocal masked molecular learning.
@@ -6,7 +6,6 @@ Implicit conformational perception via geometry-aware reciprocal masked molecula
 
 # Implicit conformational perception via geometry-aware
 reciprocal masked molecular learning
->>>>>>> 2cb16e5115582f11b357abb6e2bcf9c5756c8291
 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee8c00.svg)](https://pytorch.org/)
@@ -272,4 +271,4 @@ z = model.get_molecular_embedding(graph_data)
 ## 📊 Reproducing Activity Cliff & LNP Results
 To reproduce the 30-target Activity Cliff analysis and the LNP delivery efficiency linear probing results presented in the paper, please refer to the Jupyter notebooks in the notebooks/ directory:
 notebooks/01_activity_cliff_30_targets.ipynb
->>>>>>> 2cb16e5115582f11b357abb6e2bcf9c5756c8291
+
