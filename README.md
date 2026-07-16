@@ -4,9 +4,6 @@
 Implicit conformational perception via geometry-aware reciprocal masked molecular learning.
 =======
 
-# Implicit conformational perception via geometry-aware
-reciprocal masked molecular learning
-
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee8c00.svg)](https://pytorch.org/)
 [![PyG](https://img.shields.io/badge/PyG-2.3+-3c7fb0.svg)](https://pytorch-geometric.readthedocs.io/)
@@ -212,7 +209,3 @@ The returned dictionary includes `tail_disorder`, `rmsd_std`, `usr_variance`, `c
 ```bash
 python -m compileall loader model trainer utils finetune
 ```
-
-## License
-
-This project is released under the MIT License.
