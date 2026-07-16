@@ -1,6 +1,11 @@
+
 # RMMol
 
 Implicit conformational perception via geometry-aware reciprocal masked molecular learning.
+=======
+
+# Implicit conformational perception via geometry-aware
+reciprocal masked molecular learning
 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee8c00.svg)](https://pytorch.org/)
