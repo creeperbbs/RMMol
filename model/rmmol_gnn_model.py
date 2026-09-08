@@ -18,9 +18,16 @@ num_bond_type = 6
 num_bond_direction = 3
 from torch_geometric.utils import add_self_loops
 
-class GraphDegreeConv(nn.Module):
+class GeometryAwareDMPConv(nn.Module):
+    """Geometry-aware decoupled message passing (DMP) convolution.
+
+    The layer routes messages through independent degree-conditioned pathways.
+    Node degree is kept as the routing signal because it acts as a local
+    physicochemical proxy for hybridization and coarse 3D geometry.
+    """
+
     def __init__(self, node_size, edge_size, output_size, degree_list, device, batch_normalize=True):
-        super(GraphDegreeConv, self).__init__()
+        super(GeometryAwareDMPConv, self).__init__()
         self.node_size = node_size
         self.edge_size = edge_size
         self.output_size = output_size
@@ -151,10 +158,10 @@ class GNN(nn.Module):
         for _ in range(num_layer-1):
             if gnn_type == "gin":
                 self.gnns.append(GINConv(emb_dim, emb_dim))
-            elif gnn_type == "degree":
+            elif gnn_type in {"dmp", "degree"}:
                 if _ == 0:
                     self.gnns.append(
-                    GraphDegreeConv(
+                    GeometryAwareDMPConv(
                         node_size=self.atom_emb_dim,
                         edge_size=self.bond_emb_dim,
                         output_size=emb_dim,
@@ -164,7 +171,7 @@ class GNN(nn.Module):
                 )
                 else:
                     self.gnns.append(
-                        GraphDegreeConv(
+                        GeometryAwareDMPConv(
                             node_size=emb_dim,
                             edge_size=self.bond_emb_dim,
                             output_size=emb_dim,
@@ -172,7 +179,7 @@ class GNN(nn.Module):
                             device=self.device
                         )
                     )
-        self.gnns.append( GraphDegreeConv(
+        self.gnns.append( GeometryAwareDMPConv(
                             node_size=emb_dim,
                             edge_size=self.bond_emb_dim,
                             output_size=emb_dim,
@@ -282,6 +289,8 @@ class GNN(nn.Module):
         atom_activations_original = torch.zeros_like(atom_activations)
         atom_activations_original[to_map] = atom_activations
         return atom_activations_original, self.out_lin(graph_rep)
+
+DMPConv = GeometryAwareDMPConv
     
 class GNNDecoder(torch.nn.Module):
     def __init__(self, hidden_dim, out_dim, JK = "last", drop_ratio = 0, gnn_type = "gin"):

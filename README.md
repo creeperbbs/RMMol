@@ -1,19 +1,26 @@
 
 # RMMol
 
-Implicit conformational perception via geometry-aware reciprocal masked molecular learning.
-=======
+Implicit conformational perception via reciprocal masked molecular learning with a geometry-aware decoupled message passing (DMP) encoder.
 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee8c00.svg)](https://pytorch.org/)
 [![PyG](https://img.shields.io/badge/PyG-2.3+-3c7fb0.svg)](https://pytorch-geometric.readthedocs.io/)
 
-RMMol is a self-supervised molecular pre-training framework for learning graph representations that preserve local chemistry and implicit conformational cues from 2D molecular graphs. The repository includes reciprocal masked molecular learning, downstream embedding extraction, activity cliff utilities, lipid physical proxies, and a Functional Group Knockout Perturbation (FGKP) toolkit for interpretable SAR analysis.
+RMMol is a self-supervised molecular pre-training framework for learning graph representations that preserve local chemistry and implicit conformational cues from 2D molecular graphs. The repository includes reciprocal masked molecular learning, the geometry-aware decoupled message passing (DMP) encoder, downstream embedding extraction, activity cliff utilities, lipid physical proxies, and a Functional Group Knockout Perturbation (FGKP) toolkit for interpretable SAR analysis.
+
+## Framework Overview
+
+- Activity cliff setting: structurally similar molecules with high 2D topological similarity can show large activity differences because of subtle 3D conformational variation.
+- Reciprocal masked pre-training: each molecule is decomposed into two mutually incomplete and complementary graph views, `VA` and `VB`. A shared encoder reconstructs masked regions in one view from the visible context of the other view, with stop-gradient re-masking to discourage trivial local denoising.
+- Geometry-aware decoupled message passing (DMP) encoder: node degrees act as local physicochemical proxies for hybridization and coarse 3D geometry, such as degree 3 for sp2-like planar environments and degree 4 for sp3-like tetrahedral environments. Messages are routed through independent degree-conditioned weight matrices to decouple propagation pathways, and masked-neighbour perturbations are handled by dynamic degree adaptation.
+- Downstream applications: molecular property prediction provides the baseline benchmark, activity cliff resolution probes stereochemical sensitivity, lipid nanoparticle delivery evaluates cross-domain transferability, and gastric cancer drug repurposing with the FGKP system supports counterfactual mechanistic interpretation for virtual screening.
 
 ## Highlights
 
 - Learns implicit conformational signals from 2D molecular topology.
 - Uses reciprocal masked reconstruction across complementary molecular graph views.
+- Uses a geometry-aware decoupled message passing (DMP) encoder for degree-conditioned propagation routes.
 - Supports topology-aware contrastive learning when fingerprints are available, and falls back to standard NT-Xent otherwise.
 - Provides RDKit-based activity cliff, USR, FCFP, and lipid descriptor utilities.
 - Includes an FGKP workflow for functional-group perturbation and activity attribution.
@@ -29,7 +36,7 @@ RMMol/
     loader.py                   # SMILES-to-PyG graph conversion and masking
     zinc_script.py              # Hugging Face datasets loader for SMILES text files
   model/
-    rmmol_gnn_model.py          # Encoder and decoder model components
+    rmmol_gnn_model.py          # Geometry-aware DMP encoder and decoder components
   trainer/
     pretrain_lightning.py       # PyTorch Lightning training CLI
   utils/
@@ -112,6 +119,7 @@ Important config fields:
 - `output_dir`: directory for Lightning logs and checkpoints.
 - `batch_size`, `epochs`, `num_workers`: training throughput controls.
 - `num_layer`, `emb_dim`, `feat_dim`: model capacity.
+- `gnn_type`: message-passing backend; `dmp` selects the geometry-aware decoupled message passing encoder, while legacy `degree` remains accepted for compatibility.
 - `mask_rate`, `mask_edge_rate`, `num_remasking`: masking and reconstruction controls.
 - `contrastive_weight`, `lambda_divergence`: representation regularization controls.
 
@@ -209,3 +217,7 @@ The returned dictionary includes `tail_disorder`, `rmsd_std`, `usr_variance`, `c
 ```bash
 python -m compileall loader model trainer utils finetune
 ```
+
+## License
+
+This project is released under the MIT License.
