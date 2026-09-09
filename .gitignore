@@ -2,3 +2,6 @@ ckpt/
 ckpt/
 ./ckpt/
 *.ckpt
+RMMol-main.zip
+__pycache__/
+*.pyc
