@@ -1,0 +1,43 @@
+task,method,value,std,note
+BACE,RMMol,89.63,1.5,GraphWorld plot_eval reported value
+BACE,MoLFormer,89.27,1.48,GraphWorld plot_eval reported value
+BACE,MoleBERT,84.96,2.07,GraphWorld plot_eval reported value
+BACE,GROVER,87.5,1.56,GraphWorld plot_eval reported value
+BACE,UniMol,82.56,1.94,GraphWorld plot_eval reported value
+BACE,FCFP,87.33,0.0,GraphWorld plot_eval reported value
+BACE,ConfSeq,87.03935775406599,0.0,ConfSeq benchmark value
+Clintox,RMMol,81.18,3.34,ClinTox FDA_APPROVED label used for the domain summary
+Clintox,MoLFormer,82.79,3.15,ClinTox FDA_APPROVED label used for the domain summary
+Clintox,MoleBERT,76.72,6.63,ClinTox FDA_APPROVED label used for the domain summary
+Clintox,GROVER,72.32,7.15,ClinTox FDA_APPROVED label used for the domain summary
+Clintox,UniMol,76.11,7.8,ClinTox FDA_APPROVED label used for the domain summary
+Clintox,FCFP,87.51,0.0,ClinTox FDA_APPROVED label used for the domain summary
+Clintox,ConfSeq,75.39053093761353,6.38127168216158,ClinTox FDA_APPROVED label used for the domain summary
+Tox21,RMMol,81.67,4.56,GraphWorld plot_eval reported value
+Tox21,MoLFormer,76.74,5.74,GraphWorld plot_eval reported value
+Tox21,MoleBERT,84.73,4.76,GraphWorld plot_eval reported value
+Tox21,GROVER,80.26,0.38,GraphWorld plot_eval reported value
+Tox21,UniMol,80.01,1.95,GraphWorld plot_eval reported value
+Tox21,FCFP,76.74,4.48,GraphWorld plot_eval reported value
+Tox21,ConfSeq,75.56025642345693,4.95152378280825,ConfSeq benchmark value
+Sider,RMMol,65.47,6.41,GraphWorld plot_eval reported value
+Sider,MoLFormer,61.03,3.74,GraphWorld plot_eval reported value
+Sider,MoleBERT,66.29,6.19,GraphWorld plot_eval reported value
+Sider,GROVER,66.12,0.37,GraphWorld plot_eval reported value
+Sider,UniMol,63.41,6.23,GraphWorld plot_eval reported value
+Sider,FCFP,63.86,5.11,GraphWorld plot_eval reported value
+Sider,ConfSeq,60.73149203252057,4.2464716939057805,ConfSeq benchmark value
+HIV,RMMol,81.46,1.95,GraphWorld plot_eval reported value
+HIV,MoLFormer,81.54,0.79,GraphWorld plot_eval reported value
+HIV,MoleBERT,83.69,1.0,GraphWorld plot_eval reported value
+HIV,GROVER,81.77,1.55,GraphWorld plot_eval reported value
+HIV,UniMol,77.85,1.58,GraphWorld plot_eval reported value
+HIV,FCFP,83.49,1.21,GraphWorld plot_eval reported value
+HIV,ConfSeq,80.73685996926885,0.0,ConfSeq benchmark value
+BBBP,RMMol,91.0,1.59,GraphWorld plot_eval reported value
+BBBP,MoLFormer,89.25,0.0001,GraphWorld plot_eval reported value
+BBBP,MoleBERT,87.95,2.19,GraphWorld plot_eval reported value
+BBBP,GROVER,89.31,1.92,GraphWorld plot_eval reported value
+BBBP,UniMol,89.36,1.81,GraphWorld plot_eval reported value
+BBBP,FCFP,85.74,0.0,GraphWorld plot_eval reported value
+BBBP,ConfSeq,89.43312380370278,0.0,ConfSeq benchmark value

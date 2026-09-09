@@ -32,6 +32,9 @@ RMMol is a self-supervised molecular pre-training framework for learning graph r
 RMMol/
   configs/
     pretrain_zinc.yaml          # Default self-supervised pre-training config
+  examples/
+    conformation_distance_evaluation.ipynb
+    moleculenet_5fold_results.ipynb
   loader/
     loader.py                   # SMILES-to-PyG graph conversion and masking
     zinc_script.py              # Hugging Face datasets loader for SMILES text files
@@ -44,6 +47,7 @@ RMMol/
     loss.py                     # SCE and topology-aware NT-Xent losses
     metrics.py                  # Regression, classification, and cliff metrics
   requirements.txt
+  LICENSE
   README.md
 ```
 
@@ -56,6 +60,20 @@ The main utility functions are organized in `utils/chem_utils.py`:
 - Lipid physical proxies: `calculate_lipid_physical_descriptors`, `calculate_conformational_entropy_proxy`, `saturate_carbon_double_bonds`.
 - FGKP workflow: `FunctionalGroupDetector`, `FunctionalGroupKnockout`, `FeatureBasedActivityChangeQuantifier`, `CausalDiscoveryAnalyzer`, `ActivityFGKPEngine`.
 - Model helpers: `EnsembleRegressor`.
+
+## Examples
+
+The `examples/` directory contains lightweight Jupyter notebooks and compact result snapshots for two public demonstrations:
+
+- Conformation-distance evaluation: sampled LNPDB ionizable-lipid pairs comparing embedding distance with RDKit USR conformational distance.
+- Molecular representation learning: 5-fold MolecularNet-style results for BBBP, BACE, HIV, the FDA-approved ClinTox label, Tox21, SIDER, ESOL, FreeSolv, Lipophilicity and QM9, including a BBBP fold-level multi-model comparison.
+
+## Model Weights and Hardware
+
+Pretrained RMMol weights are hosted on Hugging Face and can be downloaded from [Creeperbbs/RMMol](https://huggingface.co/Creeperbbs/RMMol). The released checkpoint corresponds to the geometry-aware decoupled message passing (DMP) encoder used by the examples in this repository.
+
+- Pre-training hardware: 8 x NVIDIA A800 40GB GPUs.
+- Evaluation hardware: inference examples were run on the current `spark` workstation.
 
 ## Environment Setup
 
