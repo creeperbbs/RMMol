@@ -1,7 +1,7 @@
 
 # RMMol
 
-Implicit conformational perception via reciprocal masked molecular learning with a geometry-aware decoupled message passing (DMP) encoder.
+Implicit conformational perception via reciprocal masked molecular learning.
 
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee8c00.svg)](https://pytorch.org/)
