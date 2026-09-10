@@ -70,7 +70,7 @@ The `examples/` directory contains lightweight Jupyter notebooks and compact res
 
 ## Model Weights and Hardware
 
-Pretrained RMMol weights are hosted on Hugging Face and can be downloaded from [Creeperbbs/RMMol](https://huggingface.co/Creeperbbs/RMMol). The released checkpoint corresponds to the geometry-aware decoupled message passing (DMP) encoder used by the examples in this repository.
+Pretrained RMMol weights are hosted on Hugging Face and can be downloaded from [RMMol](https://huggingface.co/Creeperbbs/RMMol). The released checkpoint corresponds to the geometry-aware decoupled message passing (DMP) encoder used by the examples in this repository. The running examples and data will be further released in the future.
 
 - Pre-training hardware: 8 x NVIDIA A800 40GB GPUs.
 - Evaluation hardware: inference examples were run on the current `spark` workstation.
